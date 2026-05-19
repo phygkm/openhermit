@@ -35,6 +35,7 @@ export type {
   ScheduleUpdateInput,
   ScheduleType,
   ScheduleStatus,
+  ScheduleSessionMode,
   ScheduleDelivery,
   SchedulePolicy,
   ScheduleRunRecord,
