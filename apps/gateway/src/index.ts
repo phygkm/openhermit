@@ -24,6 +24,8 @@ import {
   DbSecretStore,
   DbAgentChannelStore,
   DbMetaStore,
+  DbModelProviderStore,
+  DbGatewaySecretStore,
   LocalAttachmentStorage,
   S3AttachmentStorage,
   SupabaseAttachmentStorage,
@@ -186,6 +188,8 @@ export const main = async (): Promise<void> => {
   let attachmentStore: DbAttachmentStore | undefined;
   let metaStore: DbMetaStore | undefined;
   let sessionStore: DbSessionStore | undefined;
+  let modelProviderStore: DbModelProviderStore | undefined;
+  let gatewaySecretStore: DbGatewaySecretStore | undefined;
   if (process.env.DATABASE_URL) {
     try {
       await runMigrations();
@@ -203,8 +207,10 @@ export const main = async (): Promise<void> => {
       attachmentStore = await DbAttachmentStore.open();
       metaStore = await DbMetaStore.open();
       sessionStore = await DbSessionStore.open();
+      modelProviderStore = await DbModelProviderStore.open();
       if (process.env.OPENHERMIT_SECRETS_KEY) {
         agentChannelStore = await DbAgentChannelStore.open();
+        gatewaySecretStore = await DbGatewaySecretStore.open();
       }
       logStartup('agent store connected');
     } catch (error) {
@@ -301,6 +307,10 @@ export const main = async (): Promise<void> => {
   // Pass skill store to instances so agent runners can access DB skills.
   if (mcpServerStore) {
     instances.setMcpServerStore(mcpServerStore);
+  }
+
+  if (gatewaySecretStore) {
+    instances.setGatewaySecretStore(gatewaySecretStore);
   }
 
   if (configStore) {
@@ -429,6 +439,8 @@ export const main = async (): Promise<void> => {
       : {}),
     ...(metaStore ? { metaStore } : {}),
     ...(sessionStore ? { sessionStore } : {}),
+    ...(modelProviderStore ? { modelProviderStore } : {}),
+    ...(gatewaySecretStore ? { gatewaySecretStore } : {}),
     sandboxPresets: config.sandboxPresets,
     autoProvisionSandbox: config.autoProvisionSandbox,
     channelRegistry: channels,
@@ -562,6 +574,8 @@ export const main = async (): Promise<void> => {
     await mcpServerStore?.close();
     await sessionStore?.close();
     await attachmentStore?.close();
+    await modelProviderStore?.close();
+    await gatewaySecretStore?.close();
 
     server.close(() => {
       logStartup('server closed');

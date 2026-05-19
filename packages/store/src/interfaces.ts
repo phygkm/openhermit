@@ -20,6 +20,7 @@ import type {
   MemoryEntry,
   MemorySearchOptions,
   MemoryUpdateInput,
+  ModelProviderRecord,
   PersistedSessionIndexEntry,
   PolicyRecord,
   SandboxCreateInput,
@@ -377,4 +378,34 @@ export interface InternalStateStore {
   users: UserStore;
   schedules: ScheduleStore;
   close(): Promise<void>;
+}
+
+// ── Gateway-level stores (no agent scope) ─────────────────────────────
+
+/**
+ * Global model registry. An administrator registers models here; agents
+ * select from the enabled set at runtime. Each entry carries the
+ * provider/model identifiers, optional overrides (base_url, api,
+ * thinking), and the name of the gateway_secret that holds the API key.
+ */
+export interface ModelProviderStore {
+  list(enabledOnly?: boolean): Promise<ModelProviderRecord[]>;
+  get(id: string): Promise<ModelProviderRecord | undefined>;
+  create(record: Omit<ModelProviderRecord, 'createdAt' | 'updatedAt'>): Promise<ModelProviderRecord>;
+  update(id: string, patch: Partial<Pick<ModelProviderRecord, 'name' | 'provider' | 'model' | 'maxTokens' | 'baseUrl' | 'api' | 'thinking' | 'secretName' | 'enabled'>>): Promise<ModelProviderRecord | undefined>;
+  delete(id: string): Promise<void>;
+}
+
+/**
+ * Gateway-level secret storage. Same encryption as agent_secrets
+ * (AES-256-GCM via OPENHERMIT_SECRETS_KEY), but scoped globally rather
+ * than per-agent. Used to store shared API keys that multiple agents
+ * and model_providers reference.
+ */
+export interface GatewaySecretStore {
+  /** Returns name → { value, passThrough } entries. */
+  listEntries(): Promise<Record<string, SecretEntry>>;
+  get(name: string): Promise<string | undefined>;
+  set(name: string, value: string): Promise<void>;
+  delete(name: string): Promise<void>;
 }

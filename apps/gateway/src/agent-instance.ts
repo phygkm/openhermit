@@ -7,7 +7,7 @@ import {
   createLangfuseShutdownHandler,
   type LangfuseClientLike,
 } from '@openhermit/agent/langfuse';
-import type { AgentConfigStore, AgentStore, ApprovalRequestStore, AttachmentStorage, AttachmentStore, McpServerStore, PolicyStore, SandboxStore, SecretStore, SkillStore } from '@openhermit/store';
+import type { AgentConfigStore, AgentStore, ApprovalRequestStore, AttachmentStorage, AttachmentStore, GatewaySecretStore, McpServerStore, PolicyStore, SandboxStore, SecretStore, SkillStore } from '@openhermit/store';
 
 import type { ChannelPool } from './channel-pool.js';
 
@@ -57,6 +57,8 @@ export class AgentInstanceManager {
   private configStore: AgentConfigStore | undefined;
   /** File-backed (today) secret store. */
   private secretStore: SecretStore | undefined;
+  /** Gateway-level shared secret store for model provider API keys. */
+  private gatewaySecretStore: GatewaySecretStore | undefined;
   /** DB-backed agent store (for backend state persistence). */
   private agentStore: AgentStore | undefined;
   /** DB-backed sandbox store (one row per agent sandbox). */
@@ -89,6 +91,10 @@ export class AgentInstanceManager {
 
   setSecretStore(store: SecretStore): void {
     this.secretStore = store;
+  }
+
+  setGatewaySecretStore(store: GatewaySecretStore): void {
+    this.gatewaySecretStore = store;
   }
 
   setAgentStore(store: AgentStore): void {
@@ -210,6 +216,7 @@ export class AgentInstanceManager {
       ...(this.approvalRequestStore ? { approvalRequestStore: this.approvalRequestStore } : {}),
       ...(this.attachmentStore ? { attachmentStore: this.attachmentStore } : {}),
       ...(this.attachmentStorage ? { attachmentStorage: this.attachmentStorage } : {}),
+      ...(this.gatewaySecretStore ? { gatewaySecretStore: this.gatewaySecretStore } : {}),
     });
 
     this.runners.set(agentId, runner);

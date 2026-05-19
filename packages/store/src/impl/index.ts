@@ -82,6 +82,8 @@ export {
 } from './supabase-attachment-storage.js';
 export { FileSecretStore, type ConfigDirResolver } from './file-secret-store.js';
 export { DbSecretStore, generateSecretsKey } from './db-secret-store.js';
+export { DbGatewaySecretStore } from './db-gateway-secret-store.js';
+export { DbModelProviderStore } from './db-model-provider-store.js';
 export {
   DbAgentChannelStore,
   type AgentChannelRow,

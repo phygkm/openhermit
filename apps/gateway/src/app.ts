@@ -33,6 +33,8 @@ import type {
   DbSkillStore,
   DbUserStore,
   DbAgentChannelStore,
+  DbModelProviderStore,
+  DbGatewaySecretStore,
   SandboxStore,
   AttachmentStorage,
 } from '@openhermit/store';
@@ -254,6 +256,10 @@ export interface GatewayAppOptions {
   publicDir?: string | undefined;
   /** CORS allowed origin (default: '*'). */
   corsOrigin?: string | undefined;
+  /** Global model provider registry. Admin-managed; agents select from enabled entries. */
+  modelProviderStore?: DbModelProviderStore | undefined;
+  /** Gateway-level secret store for shared API keys. */
+  gatewaySecretStore?: DbGatewaySecretStore | undefined;
 }
 
 // ─── Resolve runner helper ────────────────────────────────────────────────────
@@ -279,6 +285,7 @@ const resolveRunner = async (
 
 export const createGatewayApp = (options: GatewayAppOptions): Hono => {
   const { instances, agentStore, adminToken, userStore, configStore } = options;
+  const { modelProviderStore, gatewaySecretStore } = options;
   const log = options.logger ?? ((msg: string) => console.log(msg));
   const app = new Hono();
 
@@ -864,7 +871,32 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
         500,
       );
     }
-    const templateConfig = buildDefaultAgentConfig(record.workspaceDir);
+    let templateConfig = buildDefaultAgentConfig(record.workspaceDir);
+
+    // If a global model registry is configured, use the first enabled
+    // model as the default instead of the hardcoded fallback.
+    if (modelProviderStore) {
+      try {
+        const enabledModels = await modelProviderStore.list(true);
+        const defaultModel = enabledModels[0];
+        if (defaultModel) {
+          templateConfig = {
+            ...templateConfig,
+            model: {
+              provider: defaultModel.provider,
+              model: defaultModel.model,
+              max_tokens: defaultModel.maxTokens,
+              ...(defaultModel.baseUrl ? { base_url: defaultModel.baseUrl } : {}),
+              ...(defaultModel.api ? { api: defaultModel.api } : {}),
+              ...(defaultModel.thinking ? { thinking: defaultModel.thinking as any } : {}),
+            },
+          };
+        }
+      } catch {
+        // Ignore — fallback to the built-in default.
+      }
+    }
+
     if (
       body.access !== undefined &&
       body.access !== 'public' &&
@@ -1754,6 +1786,176 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     } catch (err) {
       throw new ValidationError(err instanceof Error ? err.message : String(err));
     }
+  });
+
+  // ── Model providers (admin-only) ───────────────────────────────────
+  // Global model registry: admins register models, agents pick from
+  // the enabled set.
+
+  app.get('/api/admin/models', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!modelProviderStore) {
+      throw new OpenHermitError('Model provider store is not configured.', 'not_configured', 500);
+    }
+    const models = await modelProviderStore.list(false);
+
+    // Enrich each model with whether its associated gateway secret is set.
+    const enriched = await Promise.all(models.map(async (m) => {
+      let secretSet = false;
+      if (gatewaySecretStore) {
+        const val = await gatewaySecretStore.get(m.secretName);
+        secretSet = val != null && val.length > 0;
+      }
+      return { ...m, secretSet };
+    }));
+    return c.json(enriched);
+  });
+
+  app.post('/api/admin/models', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!modelProviderStore) {
+      throw new OpenHermitError('Model provider store is not configured.', 'not_configured', 500);
+    }
+    const body = await c.req.json().catch(() => undefined) as Record<string, unknown> | undefined;
+    if (!body || typeof body !== 'object') {
+      throw new ValidationError('Body must be a JSON object.');
+    }
+    if (!body.id || typeof body.id !== 'string') throw new ValidationError('id is required.');
+    if (!body.provider || typeof body.provider !== 'string') throw new ValidationError('provider is required.');
+    if (!body.model || typeof body.model !== 'string') throw new ValidationError('model is required.');
+    if (!body.secretName || typeof body.secretName !== 'string') throw new ValidationError('secretName is required.');
+
+    const existing = await modelProviderStore.get(body.id as string);
+    if (existing) {
+      return c.json({ error: { code: 'conflict', message: `Model already exists: ${body.id}` } }, 409);
+    }
+
+    const record = await modelProviderStore.create({
+      id: body.id as string,
+      name: (body.name as string) ?? (body.model as string),
+      provider: body.provider as string,
+      model: body.model as string,
+      maxTokens: typeof body.maxTokens === 'number' ? body.maxTokens : 8192,
+      baseUrl: typeof body.baseUrl === 'string' ? body.baseUrl : null,
+      api: typeof body.api === 'string' ? body.api : null,
+      thinking: typeof body.thinking === 'string' ? body.thinking : null,
+      secretName: body.secretName as string,
+      enabled: typeof body.enabled === 'boolean' ? body.enabled : true,
+    });
+    return c.json(record, 201);
+  });
+
+  app.put('/api/admin/models/:id', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!modelProviderStore) {
+      throw new OpenHermitError('Model provider store is not configured.', 'not_configured', 500);
+    }
+    const id = c.req.param('id') ?? '';
+    const body = await c.req.json().catch(() => undefined) as Record<string, unknown> | undefined;
+    if (!body || typeof body !== 'object') {
+      throw new ValidationError('Body must be a JSON object.');
+    }
+    const patch: Record<string, unknown> = {};
+    if (body.name !== undefined) patch.name = body.name;
+    if (body.provider !== undefined) patch.provider = body.provider;
+    if (body.model !== undefined) patch.model = body.model;
+    if (body.maxTokens !== undefined) patch.maxTokens = body.maxTokens;
+    if (body.baseUrl !== undefined) patch.baseUrl = body.baseUrl;
+    if (body.api !== undefined) patch.api = body.api;
+    if (body.thinking !== undefined) patch.thinking = body.thinking;
+    if (body.secretName !== undefined) patch.secretName = body.secretName;
+    if (body.enabled !== undefined) patch.enabled = body.enabled;
+
+    const updated = await modelProviderStore.update(id, patch as any);
+    if (!updated) {
+      return c.json({ error: { code: 'not_found', message: `Model not found: ${id}` } }, 404);
+    }
+    return c.json(updated);
+  });
+
+  app.delete('/api/admin/models/:id', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!modelProviderStore) {
+      throw new OpenHermitError('Model provider store is not configured.', 'not_configured', 500);
+    }
+    const id = c.req.param('id') ?? '';
+    await modelProviderStore.delete(id);
+    return c.json({ ok: true });
+  });
+
+  // ── Gateway secrets (admin-only) ───────────────────────────────────
+  // Global API key storage shared across agents.
+
+  app.get('/api/admin/gateway/secrets', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!gatewaySecretStore) {
+      throw new OpenHermitError('Gateway secret store is not configured.', 'not_configured', 500);
+    }
+    const all = await gatewaySecretStore.listEntries();
+    const out: Record<string, { masked: string }> = {};
+    for (const [k, entry] of Object.entries(all)) {
+      out[k] = { masked: maskSecret(entry.value) };
+    }
+    return c.json(out);
+  });
+
+  app.put('/api/admin/gateway/secrets/:name', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!gatewaySecretStore) {
+      throw new OpenHermitError('Gateway secret store is not configured.', 'not_configured', 500);
+    }
+    const name = c.req.param('name') ?? '';
+    if (!name) throw new ValidationError('Secret name required.');
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new ValidationError(
+        'Secret name must be a valid POSIX env-var identifier (letters, digits, underscore; not starting with a digit).',
+      );
+    }
+    const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new ValidationError('Body must be a JSON object.');
+    }
+    const value = body.value;
+    if (typeof value !== 'string') {
+      throw new ValidationError('value (string) is required.');
+    }
+    await gatewaySecretStore.set(name, value);
+    return c.json({ ok: true });
+  });
+
+  app.delete('/api/admin/gateway/secrets/:name', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!gatewaySecretStore) {
+      throw new OpenHermitError('Gateway secret store is not configured.', 'not_configured', 500);
+    }
+    const name = c.req.param('name') ?? '';
+    if (!name) throw new ValidationError('Secret name required.');
+    await gatewaySecretStore.delete(name);
+    return c.json({ ok: true });
+  });
+
+  // ── Agent available models (owner/admin) ───────────────────────────
+  // Returns enabled models from the global registry that the agent can
+  // switch to. Includes whether the associated API key is configured.
+
+  app.get('/api/agents/:agentId/available-models', async (c) => {
+    const agentId = c.req.param('agentId') ?? '';
+    await requireOwnerOrAdmin(c, agentId);
+    if (!modelProviderStore) {
+      // No model provider store configured — return empty list so the UI
+      // falls back to the pi-ai catalog (backward compatible).
+      return c.json([]);
+    }
+    const models = await modelProviderStore.list(true);
+    const enriched = await Promise.all(models.map(async (m) => {
+      let secretSet = false;
+      if (gatewaySecretStore) {
+        const val = await gatewaySecretStore.get(m.secretName);
+        secretSet = val != null && val.length > 0;
+      }
+      return { ...m, secretSet };
+    }));
+    return c.json(enriched);
   });
 
   app.get('/api/agents/:agentId/info', async (c) => {

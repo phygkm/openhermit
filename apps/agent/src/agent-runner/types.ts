@@ -1,6 +1,6 @@
 import type { Agent, StreamFn } from '@mariozechner/pi-agent-core';
 import type { SessionStatus } from '@openhermit/protocol';
-import type { ApprovalRequestStore, AttachmentStorage, AttachmentStore, InternalStateStore, McpServerStore, PolicyStore, SandboxStore, SkillStore, UserRole } from '@openhermit/store';
+import type { ApprovalRequestStore, AttachmentStorage, AttachmentStore, GatewaySecretStore, InternalStateStore, McpServerStore, PolicyStore, SandboxStore, SkillStore, UserRole } from '@openhermit/store';
 
 import type { LangfuseClientLike, LangfuseTurnContext } from '../langfuse.js';
 import type { SessionDescriptor } from '../runtime.js';
@@ -65,4 +65,6 @@ export interface AgentRunnerOptions {
   approvalRequestStore?: ApprovalRequestStore;
   attachmentStore?: AttachmentStore;
   attachmentStorage?: AttachmentStorage;
+  /** Gateway-level secret store for shared API keys (e.g. model provider keys). Checked before process.env. */
+  gatewaySecretStore?: GatewaySecretStore;
 }

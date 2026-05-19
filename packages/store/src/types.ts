@@ -369,6 +369,23 @@ export interface ScheduleUpdateInput {
   policy?: SchedulePolicy;
 }
 
+// ── Model Providers ──────────────────────────────────────────────────
+
+export interface ModelProviderRecord {
+  id: string;
+  name: string;
+  provider: string;
+  model: string;
+  maxTokens: number;
+  baseUrl: string | null;
+  api: string | null;
+  thinking: string | null;
+  secretName: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type ScheduleRunStatus = 'running' | 'completed' | 'failed' | 'skipped';
 
 export interface ScheduleRunRecord {

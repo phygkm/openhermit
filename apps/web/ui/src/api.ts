@@ -787,6 +787,22 @@ export const putAgentConfig = (config: AgentConfig) => apiFetch<{ ok: boolean }>
 export interface ProviderCatalogEntry { provider: string; models: { id: string; reasoning: boolean }[] }
 export const fetchProviderCatalog = () => apiFetchGlobal<ProviderCatalogEntry[]>('/api/providers');
 
+// Gateway-managed available models for this agent (admin-configured)
+export interface AvailableModel {
+  id: string;
+  name: string;
+  provider: string;
+  model: string;
+  maxTokens: number;
+  baseUrl: string | null;
+  api: string | null;
+  thinking: string | null;
+  secretName: string;
+  enabled: boolean;
+  secretSet: boolean;
+}
+export const fetchAvailableModels = () => apiFetch<AvailableModel[]>('/available-models');
+
 // Policies
 export interface PolicyInfo {
   id: string;

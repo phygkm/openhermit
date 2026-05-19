@@ -16,6 +16,8 @@ export type {
   ApprovalRequestStore,
   AttachmentStore,
   AttachmentStorage,
+  ModelProviderStore,
+  GatewaySecretStore,
 } from './interfaces.js';
 
 export type {
@@ -62,6 +64,7 @@ export type {
   AttachmentMaterializationPatch,
   AttachmentMaterializationState,
   AttachmentStorageProvider,
+  ModelProviderRecord,
 } from './types.js';
 
 export { STANDALONE_AGENT_ID, standaloneScope } from './types.js';
@@ -115,4 +118,6 @@ export {
   DbMetaStore,
   generateSecretsKey,
   runMigrations,
+  DbGatewaySecretStore,
+  DbModelProviderStore,
 } from './impl/index.js';

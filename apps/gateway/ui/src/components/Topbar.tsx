@@ -3,6 +3,7 @@ import type { Tab } from '../router';
 
 const tabs: { id: Tab; label: string }[] = [
   { id: 'fleet', label: 'Agents' },
+  { id: 'models', label: 'Models' },
   { id: 'skills', label: 'Skills' },
   { id: 'mcp-servers', label: 'MCP' },
   { id: 'schedules', label: 'Schedules' },

@@ -913,7 +913,7 @@ export class AgentRunner implements SessionRuntime {
       // API key available — pi-agent-core's stream loop runs in an
       // un-awaited IIFE, so a thrown "No API key" rejects nowhere and
       // would crash the process.
-      if (!this.resolveApiKey(config.model.provider)) {
+      if (!(await this.resolveApiKey(config.model.provider))) {
         this.logRuntime(`introspection skipped: no API key for provider "${config.model.provider}"`);
         return false;
       }
@@ -1858,7 +1858,7 @@ export class AgentRunner implements SessionRuntime {
     customInstruction?: string;
     afterToolCall?: AfterToolCallHook;
   }): Promise<Agent> {
-    const webProvider = this.resolveWebProvider(input.config);
+    const webProvider = await this.resolveWebProvider(input.config);
 
     // Load exec backends once for this build — both the skill scanner and
     // the exec toolset reference the same manager.
@@ -2216,7 +2216,7 @@ export class AgentRunner implements SessionRuntime {
   private async refreshAgentConfiguration(session: RunnerSession): Promise<void> {
     await this.options.security.load();
     const config = await this.options.security.readConfig();
-    this.ensureProviderApiKey(config.model.provider);
+    await this.ensureProviderApiKey(config.model.provider);
 
     const isOwnerInteractive = session.spec.source.interactive && session.resolvedUserRole === 'owner';
     const approvalCallback = isOwnerInteractive
@@ -2567,7 +2567,7 @@ export class AgentRunner implements SessionRuntime {
     // When streamFn is provided (tests, proxied setups), the shared stream
     // should not be consumed by an internal compaction turn.
     const canRunLlmCompaction =
-      !this.options.streamFn && Boolean(this.resolveApiKey(config.model.provider));
+      !this.options.streamFn && Boolean(await this.resolveApiKey(config.model.provider));
 
     const finalMessages = await compactContextIfNeeded(sessionId, config, contextBlocks, truncatedMessages, {
       store: this.store,
@@ -2637,14 +2637,14 @@ export class AgentRunner implements SessionRuntime {
     });
   }
 
-  private resolveWebProvider(config: AgentConfig): WebProvider | undefined {
+  private async resolveWebProvider(config: AgentConfig): Promise<WebProvider | undefined> {
     const providerName = config.web?.provider ?? 'defuddle';
 
     if (providerName === 'defuddle') {
       return createWebProvider('defuddle');
     }
 
-    const apiKey = this.resolveApiKey(providerName);
+    const apiKey = await this.resolveApiKey(providerName);
     if (!apiKey) {
       this.logRuntime(`web provider "${providerName}" skipped: no API key found`);
       return undefined;
@@ -2653,15 +2653,22 @@ export class AgentRunner implements SessionRuntime {
     return createWebProvider(providerName, apiKey);
   }
 
-  private resolveApiKey(provider: string): string | undefined {
+  private async resolveApiKey(provider: string): Promise<string | undefined> {
     const candidates = createProviderSecretCandidates(provider);
 
     for (const candidate of candidates) {
       try {
         return this.options.security.resolveSecrets([candidate])[candidate];
       } catch {
-        const envValue = process.env[candidate];
+        // Agent-level secret not found — try gateway-level shared secrets.
+        const gatewayValue = this.options.gatewaySecretStore
+          ? await this.options.gatewaySecretStore.get(candidate)
+          : undefined;
+        if (gatewayValue) {
+          return gatewayValue;
+        }
 
+        const envValue = process.env[candidate];
         if (envValue) {
           return envValue;
         }
@@ -2671,8 +2678,8 @@ export class AgentRunner implements SessionRuntime {
     return undefined;
   }
 
-  private ensureProviderApiKey(provider: string): void {
-    const apiKey = this.resolveApiKey(provider);
+  private async ensureProviderApiKey(provider: string): Promise<void> {
+    const apiKey = await this.resolveApiKey(provider);
 
     if (apiKey) {
       return;

@@ -4,8 +4,10 @@ import {
   putAgentConfig,
   fetchProviderCatalog,
   fetchAgentSecrets,
+  fetchAvailableModels,
   type AgentConfig,
   type ProviderCatalogEntry,
+  type AvailableModel,
 } from '../api';
 
 /**
@@ -34,6 +36,7 @@ const CUSTOM = '__custom__';
 export function BasicPanel() {
   const [config, setConfig] = useState<AgentConfig | null>(null);
   const [catalog, setCatalog] = useState<ProviderCatalogEntry[]>([]);
+  const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [provider, setProvider] = useState('');
   const [providerMode, setProviderMode] = useState<'preset' | 'custom'>('preset');
@@ -52,11 +55,13 @@ export function BasicPanel() {
       fetchAgentConfig(),
       fetchProviderCatalog(),
       fetchAgentSecrets().catch(() => ({} as Record<string, string>)),
+      fetchAvailableModels().catch(() => []),
     ])
-      .then(([c, cat, sec]) => {
+      .then(([c, cat, sec, avail]) => {
         setConfig(c);
         setCatalog(cat);
-        setSecrets(sec);
+        setSecrets(sec as Record<string, string>);
+        setAvailableModels(avail);
         const initialProvider = c.model?.provider ?? '';
         setProvider(initialProvider);
         // If the existing provider isn't in the catalog, drop the user
@@ -143,6 +148,40 @@ export function BasicPanel() {
           memory, channels) remains unchanged.
         </p>
       </div>
+
+      {availableModels.length > 0 && (
+        <div className="basic-panel__field">
+          <label htmlFor="basic-gateway-model">Gateway Model</label>
+          <select
+            id="basic-gateway-model"
+            value=""
+            onChange={(e) => {
+              const m = availableModels.find((am) => am.id === e.target.value);
+              if (m) {
+                setProvider(m.provider);
+                setProviderMode('custom');
+                setModel(m.model);
+                setModelMode('custom');
+                setThinking((m.thinking as Thinking) ?? '');
+                setBaseUrl(m.baseUrl ?? '');
+                setApi(m.api ?? '');
+              }
+            }}
+          >
+            <option value="">— switch to a gateway model —</option>
+            {availableModels.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name} ({m.provider}/{m.model})
+                {!m.secretSet ? ' ✗ no key' : ''}
+              </option>
+            ))}
+          </select>
+          <p className="basic-panel__hint">
+            Select a model from the gateway registry. This will auto-fill
+            provider, model, and other fields below.
+          </p>
+        </div>
+      )}
 
       <div className="basic-panel__field">
         <label htmlFor="basic-provider">Provider</label>

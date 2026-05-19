@@ -4,6 +4,7 @@ import { useTabRouter } from './router';
 import { AuthScreen } from './components/AuthScreen';
 import { Topbar } from './components/Topbar';
 import { FleetPanel } from './components/FleetPanel';
+import { ModelsPanel } from './components/ModelsPanel';
 import { SkillsPanel } from './components/SkillsPanel';
 import { McpServersPanel } from './components/McpServersPanel';
 import { SchedulesPanel } from './components/SchedulesPanel';
@@ -51,6 +52,7 @@ export function App() {
     <div className="shell">
       <Topbar tab={tab} onTabChange={setTab} onSignOut={handleSignOut} />
       {tab === 'fleet' && <FleetPanel />}
+      {tab === 'models' && <ModelsPanel />}
       {tab === 'skills' && <SkillsPanel />}
       {tab === 'mcp-servers' && <McpServersPanel />}
       {tab === 'schedules' && <SchedulesPanel />}

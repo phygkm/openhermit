@@ -146,6 +146,51 @@ export const agentSecrets = pgTable('agent_secrets', {
   primaryKey({ columns: [table.agentId, table.name] }),
 ]);
 
+/**
+ * Gateway-level secrets, encrypted at rest with AES-256-GCM (same
+ * wire format and key source as agent_secrets). Stores shared API keys
+ * and other credentials that are not agent-specific — for example
+ * ANTHROPIC_API_KEY, OPENAI_API_KEY, etc. Agent secret resolution
+ * checks this table first, then falls back to agent_secrets.
+ */
+export const gatewaySecrets = pgTable('gateway_secrets', {
+  name: text('name').primaryKey(),
+  valueCiphertext: text('value_ciphertext').notNull(),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+});
+
+/**
+ * Global model registry. An administrator registers the models that
+ * are available for use across the deployment; each entry carries the
+ * provider/model identifiers, optional overrides, and the name of the
+ * gateway_secret that holds the API key. Enabled models appear in the
+ * agent model picker; disabled models are hidden but preserved.
+ */
+export const modelProviders = pgTable('model_providers', {
+  id: text('id').primaryKey(),
+  /** Human-readable display name (e.g. "Claude Opus 4"). */
+  name: text('name').notNull(),
+  /** pi-ai provider identifier (e.g. "anthropic"). */
+  provider: text('provider').notNull(),
+  /** pi-ai model identifier (e.g. "claude-opus-4-7"). */
+  model: text('model').notNull(),
+  maxTokens: integer('max_tokens').default(8192).notNull(),
+  /** Override the default base URL for this provider. */
+  baseUrl: text('base_url'),
+  /** API protocol override (e.g. "openai-completions", "anthropic-messages"). */
+  api: text('api'),
+  /** Default thinking level for thinking-capable models. */
+  thinking: text('thinking'),
+  /** Name of the gateway_secrets row holding the API key for this model. */
+  secretName: text('secret_name').notNull(),
+  enabled: boolean('enabled').default(true).notNull(),
+  createdAt: text('created_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [
+  index('idx_model_providers_enabled').on(table.enabled),
+]);
+
 export const memories = pgTable('memories', {
   agentId: text('agent_id').notNull(),
   memoryKey: text('memory_key').notNull(),
