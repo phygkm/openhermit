@@ -24,6 +24,11 @@ class DockerExecBackend implements ExecBackend {
   private readonly workspaceDir: string;
   private readonly context: BackendFactoryContext;
 
+  /** Concurrent guard: prevents multiple parallel ensure() calls from
+   *  creating duplicate containers. When one ensure is in-flight, subsequent
+   *  callers await the same promise. */
+  private ensurePromise: Promise<void> | null = null;
+
   constructor(
     config: DockerExecBackendConfig,
     context: BackendFactoryContext,
@@ -48,6 +53,21 @@ class DockerExecBackend implements ExecBackend {
   }
 
   async ensure(): Promise<void> {
+    // If an ensure is already in-flight, return the same promise to avoid
+    // duplicate container creation (concurrent exec calls race condition).
+    if (this.ensurePromise) {
+      return this.ensurePromise;
+    }
+
+    this.ensurePromise = this.ensureInternal().finally(() => {
+      // Release the lock after completion (success or failure).
+      this.ensurePromise = null;
+    });
+
+    return this.ensurePromise;
+  }
+
+  private async ensureInternal(): Promise<void> {
     const entry = await this.containerManager.ensureWorkspaceContainer(this.agentId, this.config);
     await this.context.markActive?.({
       externalId: entry.name ?? null,
@@ -56,6 +76,10 @@ class DockerExecBackend implements ExecBackend {
   }
 
   async exec(command: string, opts?: ExecOpts): Promise<ExecResult> {
+    // Ensure container is running before executing. The concurrent guard
+    // in ensure() prevents duplicate starts if called multiple times.
+    // This also handles state drift (e.g. container stopped externally).
+    await this.ensure();
     return this.containerManager.execInWorkspace(this.agentId, command, opts?.cwd);
   }
 

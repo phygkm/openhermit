@@ -362,7 +362,10 @@ export class DockerContainerManager {
     const name = this.containerName('workspace');
 
     if (!this.workspaceEntry || this.workspaceEntry.type !== 'workspace' || this.workspaceEntry.status !== 'running') {
-      // Re-probe Docker in case ensure() was not called or state drifted
+      // Re-probe Docker in case ensure() was not called or state drifted.
+      // Note: ensureWorkspaceContainer() should have been called by the
+      // backend's ensure() before this, so if we still can't find the
+      // container, it's a real failure (not just a missing ensure call).
       const liveContainers = await this.listLiveContainers();
       const live = liveContainers.find((c) => c.names === name);
       if (live && live.statusText.startsWith('Up ')) {
@@ -379,7 +382,11 @@ export class DockerContainerManager {
           runtime_container_id: live.id,
         };
       } else {
-        throw new NotFoundError(`Workspace container not found: ${name}`);
+        throw new NotFoundError(
+          `Workspace container not found: ${name}. ` +
+          `This should not happen if backend.ensure() was called. ` +
+          `Please check Docker status and agent configuration.`,
+        );
       }
     }
 

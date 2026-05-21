@@ -1,19 +1,23 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { AgentWsClient, apiFetch, fetchAgentInfo, getDisplayName, getUserId, type Connection, type SessionSummary, type HistoryMessage, type OutboundEvent, type SessionAttachment } from '../api';
 import { SessionList } from './SessionList';
 import { ChatMessages, type ChatItem } from './ChatMessages';
 import { Composer } from './Composer';
+import { FilePanel } from './FilePanel';
+import { LangToggle } from './LangToggle';
+import { SidebarRightIcon, SidebarLeftIcon } from '../icons';
 // ManagePanel only needed when user opens /manage — keep it out of the
 // hot chat path.
 const ManagePanel = lazy(() => import('./ManagePanel').then((m) => ({ default: m.ManagePanel })));
+import type { ManageTab } from './ManagePanel';
 
 type View = 'chat' | 'manage' | 'observe';
-type ManageTab = 'basic' | 'secrets' | 'skills' | 'mcp' | 'schedules' | 'channels' | 'policies';
 
 const createSessionId = () =>
   `web:${new Date().toISOString().slice(0, 10)}-${crypto.randomUUID().slice(0, 8)}`;
 
-const MANAGE_TABS: ManageTab[] = ['basic', 'secrets', 'channels', 'skills', 'mcp', 'schedules', 'policies'];
+const MANAGE_TABS: ManageTab[] = ['basic', 'channels', 'skills', 'mcp', 'schedules', 'policies'];
 
 type Route =
   | { view: 'chat'; sessionId: string | null }
@@ -56,6 +60,7 @@ interface Props {
 }
 
 export function ChatShell({ connection, role, onDisconnect }: Props) {
+  const { t } = useTranslation();
   const initialRoute = parseRoute(window.location.pathname);
   const [view, setView] = useState<View>(initialRoute.view);
   const [manageTab, setManageTab] = useState<ManageTab>(initialRoute.view === 'manage' ? initialRoute.tab : 'basic');
@@ -72,9 +77,16 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(initialSessionId);
   const [items, setItems] = useState<ChatItem[]>([]);
   const [agentName, setAgentName] = useState<string | null>(null);
-  const [status, setStatus] = useState('Connecting');
+  const [status, setStatus] = useState<'Connecting' | 'Connected' | 'Disconnected' | 'Running'>('Connecting');
+  const statusLabel = {
+    Connecting: t('chat.status_connecting'),
+    Connected: t('chat.status_connected'),
+    Disconnected: t('chat.status_disconnected'),
+    Running: t('chat.status_running'),
+  }[status];
   const [sending, setSending] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [filePanelOpen, setFilePanelOpen] = useState(false);
 
   const wsRef = useRef<AgentWsClient | null>(null);
   const currentSessionRef = useRef<string | null>(null);
@@ -372,6 +384,12 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
       }
 
       case 'tool_call':
+        // Clear streaming buffers — tool calls mark the boundary between
+        // response turns. Without this, text_delta after tool execution
+        // would accumulate onto the pre-tool text and cause duplicates.
+        streamingTextRef.current = '';
+        streamingThinkingRef.current = '';
+        thinkingAsAssistantRef.current = false;
         setItems(prev => [...collapseThinking(dropPlaceholder(prev)), {
           type: 'tool',
           tool: event.tool as string,
@@ -782,15 +800,15 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
               <img src="/logo.png" alt="" className="sidebar__logo" />
               <div>
                 <h1 className="sidebar__brand-name">OpenHermit</h1>
-                <p className="sidebar__meta">Agent: {agentName || connection.agentId}</p>
+                <p className="sidebar__meta">{t('chat.agent_label')} {agentName || connection.agentId}</p>
               </div>
             </a>
             {isOwner && (
               <button
                 type="button"
                 className={`sidebar__icon-btn${currentSessionId === 'inbox' && view === 'chat' ? ' is-active' : ''}`}
-                aria-label="Inbox"
-                title="Inbox"
+                aria-label={t('chat.inbox_aria')}
+                title={t('chat.inbox_aria')}
                 onClick={() => {
                   if (view === 'manage') setView('chat');
                   void selectSessionById('inbox');
@@ -816,7 +834,7 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                 void createNewSession();
               }}
             >
-              New Session
+              {t('chat.new_session')}
             </button>
             {isOwner && (
               <button
@@ -830,7 +848,7 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                   }
                 }}
               >
-                Manage
+                {t('chat.manage')}
               </button>
             )}
           </div>
@@ -846,7 +864,7 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                   setCurrentSessionId(null);
                   setItems([]);
                 }}
-                title="Back to my sessions"
+                title={t('chat.back_to_sessions')}
               >
                 <span className="sidebar__observe-icon" aria-hidden="true">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -854,14 +872,14 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                     <path d="m12 19-7-7 7-7" />
                   </svg>
                 </span>
-                <span className="sidebar__observe-label">Back to my sessions</span>
+                <span className="sidebar__observe-label">{t('chat.back_to_sessions')}</span>
               </button>
             ) : (
               <button
                 type="button"
                 className="sidebar__observe-btn"
                 onClick={() => void enterObserveMode()}
-                title="View other users' sessions on this agent"
+                title={t('chat.observe_title')}
               >
                 <span className="sidebar__observe-icon" aria-hidden="true">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -869,7 +887,7 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                     <circle cx="12" cy="12" r="3" />
                   </svg>
                 </span>
-                <span className="sidebar__observe-label">Observation Mode</span>
+                <span className="sidebar__observe-label">{t('chat.observation_mode')}</span>
               </button>
             )}
           </div>
@@ -879,18 +897,18 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
           currentSessionId={currentSessionId}
           onSelect={sessionId => void selectSession(sessionId)}
           onDelete={inObserveView ? undefined : (sessionId => void deleteSession(sessionId))}
-          emptyMessage={inObserveView ? 'No other-user sessions on this agent yet.' : undefined}
+          emptyMessage={inObserveView ? t('chat.observe_empty') : undefined}
         />
         <div className="sidebar__footer">
           <div>
             <div className="sidebar__footer-name">
               <span className="sidebar__footer-dot" />
-              {getDisplayName() || 'Anonymous'}
+              {getDisplayName() || t('common.anonymous')}
               {getUserId() && <span className="sidebar__footer-uid"> · {getUserId()}</span>}
             </div>
-            <div className="sidebar__footer-auth">Auth: device key · WS</div>
+            <div className="sidebar__footer-auth">{t('chat.auth_info')}</div>
           </div>
-          <button className="btn btn--ghost btn--sm" onClick={onDisconnect}>Disconnect</button>
+          <button className="btn btn--ghost btn--sm" onClick={onDisconnect}>{t('chat.disconnect')}</button>
         </div>
       </aside>
 
@@ -900,13 +918,13 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
             <header className="chat__header">
               <button
                 className="chat__back"
-                aria-label="Back to sessions"
+                aria-label={t('chat.back_aria')}
                 onClick={handleMobileBack}
               >
                 ←
               </button>
               <div>
-                <p className="eyebrow">Agent Management</p>
+                <p className="eyebrow">{t('chat.agent_management')}</p>
                 <h2>{connection.agentId}</h2>
               </div>
             </header>
@@ -921,23 +939,34 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
             <header className="chat__header">
               <button
                 className="chat__back"
-                aria-label="Back to sessions"
+                aria-label={t('chat.back_aria')}
                 onClick={handleMobileBack}
               >
                 ←
               </button>
               <div>
-                <p className="eyebrow">Current Session</p>
+                <p className="eyebrow">{t('chat.current_session')}</p>
                 <h2>{sessionTitle}</h2>
               </div>
-              <p className="chat__status">{status}</p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <LangToggle />
+                <button
+                  className={`chat__files-btn${filePanelOpen ? ' chat__files-btn--active' : ''}`}
+                  onClick={() => setFilePanelOpen(!filePanelOpen)}
+                  aria-label={t('chat.files_aria')}
+                  title={t('chat.files_title')}
+                >
+                  {filePanelOpen ? <SidebarRightIcon style={{ width: 14, height: 14 }} /> : <SidebarLeftIcon style={{ width: 14, height: 14 }} />}
+                </button>
+                <p className="chat__status">{statusLabel}</p>
+              </div>
             </header>
 
             <ChatMessages
               items={items}
               agentName={agentName ?? undefined}
               loading={loadingHistory}
-              emptyMessage={isInbox ? 'No notifications yet.' : undefined}
+              emptyMessage={isInbox ? t('chat.no_notifications') : undefined}
               onApproval={handleApproval}
               onMessageAction={handleMessageAction}
             />
@@ -946,10 +975,10 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
               <div className="composer composer--readonly">
                 <span>
                   {isInbox
-                    ? 'Read-only — inbox is the owner notification feed'
+                    ? t('chat.readonly_inbox')
                     : inObserveView
-                      ? `Read-only — observing a session from ${currentSession?.source?.platform || currentSession?.source?.kind || 'another channel'}`
-                      : `Read-only — this session was created via ${currentSession?.source?.platform || currentSession?.source?.kind || 'another channel'}`}
+                      ? t('chat.readonly_observe', { platform: currentSession?.source?.platform || currentSession?.source?.kind || 'another channel' })
+                      : t('chat.readonly_channel', { platform: currentSession?.source?.platform || currentSession?.source?.kind || 'another channel' })}
                 </span>
               </div>
             ) : (
@@ -964,6 +993,13 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
           </>
         )}
       </main>
+
+      {filePanelOpen && view !== 'manage' && (
+        <FilePanel
+          agentId={connection.agentId}
+          onClose={() => setFilePanelOpen(false)}
+        />
+      )}
     </div>
   );
 }

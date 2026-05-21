@@ -265,6 +265,14 @@ export class ExecBackendManager {
     );
   }
 
+  /** Ensure all backends are ready. Used for pre-starting containers
+   *  asynchronously during session open to eliminate first-exec latency. */
+  async ensureAll(): Promise<void> {
+    await Promise.allSettled(
+      [...this.backends.values()].map((b) => b.ensure()),
+    );
+  }
+
   async syncSkills(skills: SyncSkillEntry[]): Promise<void> {
     for (const backend of this.backends.values()) {
       await backend.syncSkills(skills);

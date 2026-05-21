@@ -544,12 +544,33 @@ export class AgentRunner implements SessionRuntime {
       throw new NotFoundError(`Session not found: ${spec.sessionId}`);
     }
 
-    if (
-      (config.exec?.lifecycle?.start ?? 'ondemand') === 'session'
-    ) {
-      const manager = await this.ensureExecBackendManager(config);
-      await manager.getDefault().ensure();
-      this.logRuntime(`exec backend ensured for agent ${this.scope.agentId}`);
+    // Pre-start exec backends asynchronously to eliminate first-exec latency.
+    // This works for both 'session' and 'ondemand' lifecycle policies:
+    // - 'session': container starts synchronously (existing behavior)
+    // - 'ondemand': container starts in background, ready before first exec call
+    const lifecycleStart = config.exec?.lifecycle?.start ?? 'ondemand';
+    if (this.execBackendManager) {
+      const preStartContainer = async (): Promise<void> => {
+        const startTime = Date.now();
+        try {
+          this.logRuntime(`[container] pre-starting backends for session ${spec.sessionId} (lifecycle=${lifecycleStart})`);
+          await this.execBackendManager!.ensureAll();
+          this.logRuntime(`[container] pre-start completed in ${Date.now() - startTime}ms`);
+        } catch (err) {
+          // Don't fail session open if container pre-start fails; it will
+          // be retried on first exec call with the concurrent guard.
+          this.logRuntime(`[container] pre-start failed (will retry on first exec): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      };
+
+      if (lifecycleStart === 'session') {
+        // Synchronous start: block session open until container is ready
+        await preStartContainer();
+      } else {
+        // Asynchronous pre-start: don't block session open, container will
+        // be ready before the user's first exec call (typically 1-2s later)
+        void preStartContainer();
+      }
     }
 
     const approvalGate = new ApprovalGate();

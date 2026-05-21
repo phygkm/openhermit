@@ -115,6 +115,36 @@ test('ExecBackendManager.shutdownAll calls all backends', async () => {
   assert.equal(shutdownCount, 2);
 });
 
+test('ExecBackendManager.ensureAll calls all backends', async () => {
+  let ensureCount = 0;
+  const backend = (): ExecBackend => ({
+    ...makeFakeBackend('x'),
+    id: `b-${ensureCount++}`,
+    ensure: async () => { ensureCount++; },
+  });
+  const mgr = new ExecBackendManager([backend(), backend()]);
+  ensureCount = 0;
+  await mgr.ensureAll();
+  assert.equal(ensureCount, 2);
+});
+
+test('ExecBackendManager.ensureAll tolerates failures', async () => {
+  let callCount = 0;
+  const successBackend = (): ExecBackend => ({
+    ...makeFakeBackend('ok'),
+    ensure: async () => { callCount++; },
+  });
+  const failingBackend = (): ExecBackend => ({
+    ...makeFakeBackend('fail'),
+    ensure: async () => { callCount++; throw new Error('intentional failure'); },
+  });
+  const mgr = new ExecBackendManager([successBackend(), failingBackend()]);
+  callCount = 0;
+  // Should not throw — Promise.allSettled swallows failures
+  await mgr.ensureAll();
+  assert.equal(callCount, 2);
+});
+
 // ── File backends ────────────────────────────────────────────────────────
 
 test('host file backend: read/write/stat/list/delete round-trip', async () => {
