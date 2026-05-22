@@ -5,7 +5,6 @@ import 'katex/dist/katex.min.css';
 import remend from 'remend';
 import DOMPurify from 'dompurify';
 import { apiFetch, fetchAttachmentBlobUrl, type SessionAttachment } from '../api';
-import { useTranslation } from '../i18n';
 
 // ─── KaTeX extension for marked ────────────────────────────────────────────
 
@@ -222,7 +221,6 @@ function AttachmentChip({ attachment }: { attachment: SessionAttachment }) {
 }
 
 function AttachmentMedia({ item }: { item: Extract<ChatItem, { type: 'attachment' }> }) {
-  const { t } = useTranslation();
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -254,7 +252,7 @@ function AttachmentMedia({ item }: { item: Extract<ChatItem, { type: 'attachment
   if (error) {
     return (
       <div className="event event--error">
-        {t('chatMessages.attachmentFailed', { name: item.name || item.attachmentId, error })}
+        [attachment] failed to load {item.name || item.attachmentId}: {error}
       </div>
     );
   }
@@ -262,7 +260,7 @@ function AttachmentMedia({ item }: { item: Extract<ChatItem, { type: 'attachment
   if (!blobUrl) {
     return (
       <div className="message__body">
-        {t('chatMessages.loadingAttachment', { name: item.name || item.attachmentId })}<span className="thinking-dots" />
+        Loading attachment {item.name || item.attachmentId}<span className="thinking-dots" />
       </div>
     );
   }
@@ -275,7 +273,7 @@ function AttachmentMedia({ item }: { item: Extract<ChatItem, { type: 'attachment
         <a href={blobUrl} target="_blank" rel="noreferrer" download={downloadName}>
           <img
             src={blobUrl}
-            alt={item.name || t('chatMessages.attachmentAlt')}
+            alt={item.name || 'attachment'}
             style={{ maxWidth: '100%', maxHeight: 480, borderRadius: 8 }}
           />
         </a>
