@@ -37,7 +37,6 @@ export function PickAgentScreen({
   initialJoinToken,
   initialError,
 }: Props) {
-  const { t } = useTranslation();
   const [memberships, setMemberships] = useState<AgentMembership[] | null>(null);
   const [error, setError] = useState(initialError ?? '');
   const [joinAgentId, setJoinAgentId] = useState(initialJoinAgentId ?? '');
