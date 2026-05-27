@@ -35,14 +35,35 @@ function readPendingJoin(): PendingJoin | null {
   const params = new URLSearchParams(window.location.search);
   const agentId = (params.get('agent_id') ?? params.get('agentId') ?? '').trim();
   if (!agentId) return null;
-  const token = (params.get('token') ?? '').trim();
+  const accessToken = (params.get('token') ?? '').trim();
   params.delete('agent_id');
   params.delete('agentId');
   params.delete('token');
   const qs = params.toString();
   const url = window.location.pathname + (qs ? `?${qs}` : '') + window.location.hash;
   window.history.replaceState(null, '', url);
-  return token ? { agentId, token } : { agentId };
+  return accessToken ? { agentId, token: accessToken } : { agentId };
+}
+
+// Read a single-use exchange JWT from the URL fragment (`#token=…`), then
+// strip it. Fragments don't hit the server log or `referer`, which makes
+// them the right place to carry a short-lived credential. Returning a
+// non-null token means the caller should swap it for a session JWT via
+// `redeemExchangeToken` before any other auth work runs.
+function readPendingExchangeToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  const hash = window.location.hash.startsWith('#')
+    ? window.location.hash.slice(1)
+    : window.location.hash;
+  if (!hash) return null;
+  const params = new URLSearchParams(hash);
+  const token = (params.get('token') ?? '').trim();
+  if (!token) return null;
+  params.delete('token');
+  const rest = params.toString();
+  const url = window.location.pathname + window.location.search + (rest ? `#${rest}` : '');
+  window.history.replaceState(null, '', url);
+  return token;
 }
 
 export function App() {
@@ -50,6 +71,7 @@ export function App() {
   const [connection, setConn] = useState<Connection | null>(null);
   const [gatewayUrl, setGatewayUrl] = useState<string>('');
   const [pendingJoin, setPendingJoin] = useState<PendingJoin | null>(() => readPendingJoin());
+  const [pendingExchange] = useState<string | null>(() => readPendingExchangeToken());
   const [pendingError, setPendingError] = useState<string>('');
 
   // Try to satisfy a pending /connect?agent_id=… intent: prefer an existing
