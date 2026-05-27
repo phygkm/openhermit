@@ -116,6 +116,7 @@ export {
   SupabaseAttachmentStorage,
   type SupabaseAttachmentStorageOptions,
   DbMetaStore,
+  DbConsumedJtiStore,
   generateSecretsKey,
   runMigrations,
   DbGatewaySecretStore,
