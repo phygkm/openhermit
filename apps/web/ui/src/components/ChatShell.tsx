@@ -949,7 +949,6 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
             </div>
             <div className="sidebar__footer-auth">{t('chatShell.footerAuth')}</div>
           </div>
-          <LanguageSwitcher />
           <button className="btn btn--ghost btn--sm" onClick={onDisconnect}>{t('chatShell.disconnect')}</button>
         </div>
       </aside>
@@ -993,7 +992,10 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                 <p className="eyebrow">{t('chatShell.eyebrowSession')}</p>
                 <h2>{sessionTitle}</h2>
               </div>
-              <p className="chat__status">{t(statusLabelKey[status])}</p>
+              <div className="chat__header-actions">
+                <p className="chat__status">{t(statusLabelKey[status])}</p>
+                <LanguageSwitcher />
+              </div>
             </header>
 
             <ChatMessages
