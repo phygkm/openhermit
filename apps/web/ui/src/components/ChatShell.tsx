@@ -1,23 +1,21 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
-import { useTranslation } from 'react-i18next';
 import { AgentWsClient, apiFetch, fetchAgentInfo, getDisplayName, getUserId, type Connection, type SessionSummary, type HistoryMessage, type OutboundEvent, type SessionAttachment } from '../api';
+import { useTranslation } from '../i18n';
+import { LanguageSwitcher } from './LanguageSwitcher';
 import { SessionList } from './SessionList';
 import { ChatMessages, type ChatItem } from './ChatMessages';
 import { Composer } from './Composer';
-import { FilePanel } from './FilePanel';
-import { LangToggle } from './LangToggle';
-import { SidebarRightIcon, SidebarLeftIcon } from '../icons';
 // ManagePanel only needed when user opens /manage — keep it out of the
 // hot chat path.
 const ManagePanel = lazy(() => import('./ManagePanel').then((m) => ({ default: m.ManagePanel })));
-import type { ManageTab } from './ManagePanel';
 
 type View = 'chat' | 'manage' | 'observe';
+type ManageTab = 'basic' | 'secrets' | 'skills' | 'mcp' | 'schedules' | 'channels' | 'voice' | 'policies';
 
 const createSessionId = () =>
   `web:${new Date().toISOString().slice(0, 10)}-${crypto.randomUUID().slice(0, 8)}`;
 
-const MANAGE_TABS: ManageTab[] = ['basic', 'channels', 'skills', 'mcp', 'schedules', 'policies'];
+const MANAGE_TABS: ManageTab[] = ['basic', 'secrets', 'channels', 'voice', 'skills', 'mcp', 'schedules', 'policies'];
 
 type Route =
   | { view: 'chat'; sessionId: string | null }
@@ -78,15 +76,14 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
   const [items, setItems] = useState<ChatItem[]>([]);
   const [agentName, setAgentName] = useState<string | null>(null);
   const [status, setStatus] = useState<'Connecting' | 'Connected' | 'Disconnected' | 'Running'>('Connecting');
-  const statusLabel = {
-    Connecting: t('chat.status_connecting'),
-    Connected: t('chat.status_connected'),
-    Disconnected: t('chat.status_disconnected'),
-    Running: t('chat.status_running'),
-  }[status];
+  const statusLabelKey = {
+    Connecting: 'chatShell.statusConnecting',
+    Connected: 'chatShell.statusConnected',
+    Disconnected: 'chatShell.statusDisconnected',
+    Running: 'chatShell.statusRunning',
+  } as const;
   const [sending, setSending] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
-  const [filePanelOpen, setFilePanelOpen] = useState(false);
 
   const wsRef = useRef<AgentWsClient | null>(null);
   const currentSessionRef = useRef<string | null>(null);
@@ -258,17 +255,48 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
       if (entry.role === 'assistant' && entry.thinking) {
         historyItems.push({ type: 'thinking', text: entry.thinking, streaming: false });
       }
-      if (entry.role === 'assistant' && !entry.content) { if (entry.name) setAgentName(entry.name); continue; }
-      historyItems.push({
-        type: entry.role as 'user' | 'assistant',
-        text: entry.content,
-        streaming: false,
-        name: entry.name,
-        ...(entry.role === 'assistant' && entry.actions && entry.actions.length > 0 ? { actions: entry.actions } : {}),
-        ...(entry.role === 'user' && entry.attachments && entry.attachments.length > 0
-          ? { attachments: entry.attachments }
-          : {}),
-      });
+      const assistantAttachments =
+        entry.role === 'assistant' && entry.attachments && entry.attachments.length > 0
+          ? entry.attachments
+          : undefined;
+      if (entry.role === 'assistant' && !entry.content && !assistantAttachments) {
+        if (entry.name) setAgentName(entry.name);
+        continue;
+      }
+      if (entry.content || entry.role !== 'assistant') {
+        historyItems.push({
+          type: entry.role as 'user' | 'assistant',
+          text: entry.content,
+          streaming: false,
+          name: entry.name,
+          ...(entry.role === 'assistant' && entry.actions && entry.actions.length > 0 ? { actions: entry.actions } : {}),
+          ...(entry.role === 'user' && entry.attachments && entry.attachments.length > 0
+            ? { attachments: entry.attachments }
+            : {}),
+        });
+      }
+      if (assistantAttachments) {
+        for (const att of assistantAttachments) {
+          if (!att.id) continue;
+          const mime = att.mimeType || 'application/octet-stream';
+          const kind: 'image' | 'audio' | 'video' | 'document' = mime.startsWith('image/')
+            ? 'image'
+            : mime.startsWith('audio/')
+              ? 'audio'
+              : mime.startsWith('video/')
+                ? 'video'
+                : 'document';
+          historyItems.push({
+            type: 'attachment',
+            sessionId,
+            attachmentId: att.id,
+            mimeType: mime,
+            kind,
+            ...(att.name ? { name: att.name } : {}),
+            ...(typeof att.size === 'number' ? { size: att.size } : {}),
+          });
+        }
+      }
       if (entry.role === 'assistant' && entry.name) setAgentName(entry.name);
     }
     flushIntrospection();
@@ -384,12 +412,6 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
       }
 
       case 'tool_call':
-        // Clear streaming buffers — tool calls mark the boundary between
-        // response turns. Without this, text_delta after tool execution
-        // would accumulate onto the pre-tool text and cause duplicates.
-        streamingTextRef.current = '';
-        streamingThinkingRef.current = '';
-        thinkingAsAssistantRef.current = false;
         setItems(prev => [...collapseThinking(dropPlaceholder(prev)), {
           type: 'tool',
           tool: event.tool as string,
@@ -503,6 +525,25 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
           }
           return [...prev, { type: 'assistant', text: finalText, streaming: false }];
         });
+        break;
+      }
+
+      case 'attachment': {
+        const attachmentItem = {
+          type: 'attachment' as const,
+          sessionId,
+          attachmentId: String(event.attachmentId ?? ''),
+          mimeType: String(event.mimeType ?? 'application/octet-stream'),
+          kind: ((event.kind as string) || 'document') as
+            | 'image'
+            | 'audio'
+            | 'video'
+            | 'document',
+          ...(typeof event.name === 'string' ? { name: event.name } : {}),
+          ...(typeof event.size === 'number' ? { size: event.size } : {}),
+          ...(typeof event.caption === 'string' ? { caption: event.caption } : {}),
+        };
+        setItems(prev => [...collapseThinking(dropPlaceholder(prev)), attachmentItem]);
         break;
       }
 
@@ -625,7 +666,7 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
   const deleteSession = useCallback(async (sessionId: string) => {
     const ws = wsRef.current;
     if (!ws) return;
-    if (!confirm('Delete this session? This cannot be undone.')) return;
+    if (!confirm(t('chatShell.deleteConfirm'))) return;
     try {
       await ws.deleteSession(sessionId);
       if (currentSessionRef.current === sessionId) {
@@ -758,8 +799,8 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
     sessions.find(s => s.sessionId === currentSessionId) ??
     observeSessions.find(s => s.sessionId === currentSessionId);
   const sessionTitle = isInbox
-    ? 'Inbox'
-    : (currentSession?.description || currentSession?.lastMessagePreview || currentSessionId || 'No session');
+    ? t('chatShell.inbox')
+    : (currentSession?.description || currentSession?.lastMessagePreview || currentSessionId || t('chatShell.noSession'));
   const isWebSession = !currentSession || currentSession.source?.kind === 'api' && currentSession.source?.platform === 'web';
   // Observation sessions are always read-only — owners are peeking at
   // someone else's conversation, not participating.
@@ -787,7 +828,7 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
             <a
               className="sidebar__brand"
               href="/"
-              aria-label="OpenHermit home"
+              aria-label={t('chatShell.brandHome')}
               onClick={(e) => {
                 e.preventDefault();
                 setView('chat');
@@ -800,15 +841,15 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
               <img src="/logo.png" alt="" className="sidebar__logo" />
               <div>
                 <h1 className="sidebar__brand-name">OpenHermit</h1>
-                <p className="sidebar__meta">{t('chat.agent_label')} {agentName || connection.agentId}</p>
+                <p className="sidebar__meta">{t('chatShell.agentLabel')} {agentName || connection.agentId}</p>
               </div>
             </a>
             {isOwner && (
               <button
                 type="button"
                 className={`sidebar__icon-btn${currentSessionId === 'inbox' && view === 'chat' ? ' is-active' : ''}`}
-                aria-label={t('chat.inbox_aria')}
-                title={t('chat.inbox_aria')}
+                aria-label={t('chatShell.inbox')}
+                title={t('chatShell.inbox')}
                 onClick={() => {
                   if (view === 'manage') setView('chat');
                   void selectSessionById('inbox');
@@ -819,7 +860,7 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                   <path d="m3 7 9 6 9-6" />
                 </svg>
                 {inboxUnread > 0 && (
-                  <span className="sidebar__icon-badge" aria-label={`${inboxUnread} unread`}>
+                  <span className="sidebar__icon-badge" aria-label={t('chatShell.unreadAria', { count: inboxUnread })}>
                     {inboxUnread > 99 ? '99+' : inboxUnread}
                   </span>
                 )}
@@ -834,7 +875,7 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                 void createNewSession();
               }}
             >
-              {t('chat.new_session')}
+              {t('chatShell.newSession')}
             </button>
             {isOwner && (
               <button
@@ -848,7 +889,7 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                   }
                 }}
               >
-                {t('chat.manage')}
+                {t('chatShell.manage')}
               </button>
             )}
           </div>
@@ -864,7 +905,7 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                   setCurrentSessionId(null);
                   setItems([]);
                 }}
-                title={t('chat.back_to_sessions')}
+                title={t('chatShell.backToMy')}
               >
                 <span className="sidebar__observe-icon" aria-hidden="true">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -872,14 +913,14 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                     <path d="m12 19-7-7 7-7" />
                   </svg>
                 </span>
-                <span className="sidebar__observe-label">{t('chat.back_to_sessions')}</span>
+                <span className="sidebar__observe-label">{t('chatShell.backToMy')}</span>
               </button>
             ) : (
               <button
                 type="button"
                 className="sidebar__observe-btn"
                 onClick={() => void enterObserveMode()}
-                title={t('chat.observe_title')}
+                title={t('chatShell.observationTitle')}
               >
                 <span className="sidebar__observe-icon" aria-hidden="true">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -887,7 +928,7 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
                     <circle cx="12" cy="12" r="3" />
                   </svg>
                 </span>
-                <span className="sidebar__observe-label">{t('chat.observation_mode')}</span>
+                <span className="sidebar__observe-label">{t('chatShell.observation')}</span>
               </button>
             )}
           </div>
@@ -897,18 +938,19 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
           currentSessionId={currentSessionId}
           onSelect={sessionId => void selectSession(sessionId)}
           onDelete={inObserveView ? undefined : (sessionId => void deleteSession(sessionId))}
-          emptyMessage={inObserveView ? t('chat.observe_empty') : undefined}
+          emptyMessage={inObserveView ? t('chatShell.observeEmpty') : undefined}
         />
         <div className="sidebar__footer">
           <div>
             <div className="sidebar__footer-name">
               <span className="sidebar__footer-dot" />
-              {getDisplayName() || t('common.anonymous')}
+              {getDisplayName() || t('chatShell.footerAnonymous')}
               {getUserId() && <span className="sidebar__footer-uid"> · {getUserId()}</span>}
             </div>
-            <div className="sidebar__footer-auth">{t('chat.auth_info')}</div>
+            <div className="sidebar__footer-auth">{t('chatShell.footerAuth')}</div>
           </div>
-          <button className="btn btn--ghost btn--sm" onClick={onDisconnect}>{t('chat.disconnect')}</button>
+          <LanguageSwitcher />
+          <button className="btn btn--ghost btn--sm" onClick={onDisconnect}>{t('chatShell.disconnect')}</button>
         </div>
       </aside>
 
@@ -918,13 +960,13 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
             <header className="chat__header">
               <button
                 className="chat__back"
-                aria-label={t('chat.back_aria')}
+                aria-label={t('chatShell.backAria')}
                 onClick={handleMobileBack}
               >
                 ←
               </button>
               <div>
-                <p className="eyebrow">{t('chat.agent_management')}</p>
+                <p className="eyebrow">{t('chatShell.eyebrowManage')}</p>
                 <h2>{connection.agentId}</h2>
               </div>
             </header>
@@ -939,34 +981,23 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
             <header className="chat__header">
               <button
                 className="chat__back"
-                aria-label={t('chat.back_aria')}
+                aria-label={t('chatShell.backAria')}
                 onClick={handleMobileBack}
               >
                 ←
               </button>
               <div>
-                <p className="eyebrow">{t('chat.current_session')}</p>
+                <p className="eyebrow">{t('chatShell.eyebrowSession')}</p>
                 <h2>{sessionTitle}</h2>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <LangToggle />
-                <button
-                  className={`chat__files-btn${filePanelOpen ? ' chat__files-btn--active' : ''}`}
-                  onClick={() => setFilePanelOpen(!filePanelOpen)}
-                  aria-label={t('chat.files_aria')}
-                  title={t('chat.files_title')}
-                >
-                  {filePanelOpen ? <SidebarRightIcon style={{ width: 14, height: 14 }} /> : <SidebarLeftIcon style={{ width: 14, height: 14 }} />}
-                </button>
-                <p className="chat__status">{statusLabel}</p>
-              </div>
+              <p className="chat__status">{t(statusLabelKey[status])}</p>
             </header>
 
             <ChatMessages
               items={items}
               agentName={agentName ?? undefined}
               loading={loadingHistory}
-              emptyMessage={isInbox ? t('chat.no_notifications') : undefined}
+              emptyMessage={isInbox ? t('chatShell.inboxEmpty') : undefined}
               onApproval={handleApproval}
               onMessageAction={handleMessageAction}
             />
@@ -975,10 +1006,10 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
               <div className="composer composer--readonly">
                 <span>
                   {isInbox
-                    ? t('chat.readonly_inbox')
+                    ? t('chatShell.readOnlyInbox')
                     : inObserveView
-                      ? t('chat.readonly_observe', { platform: currentSession?.source?.platform || currentSession?.source?.kind || 'another channel' })
-                      : t('chat.readonly_channel', { platform: currentSession?.source?.platform || currentSession?.source?.kind || 'another channel' })}
+                      ? t('chatShell.readOnlyObserve', { source: currentSession?.source?.platform || currentSession?.source?.kind || t('chatShell.sourceUnknown') })
+                      : t('chatShell.readOnlyExternal', { source: currentSession?.source?.platform || currentSession?.source?.kind || t('chatShell.sourceUnknown') })}
                 </span>
               </div>
             ) : (
@@ -993,13 +1024,6 @@ export function ChatShell({ connection, role, onDisconnect }: Props) {
           </>
         )}
       </main>
-
-      {filePanelOpen && view !== 'manage' && (
-        <FilePanel
-          agentId={connection.agentId}
-          onClose={() => setFilePanelOpen(false)}
-        />
-      )}
     </div>
   );
 }

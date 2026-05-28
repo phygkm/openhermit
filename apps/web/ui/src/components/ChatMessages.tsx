@@ -1,10 +1,11 @@
-import { useEffect, useRef, useMemo } from 'react';
+import { useEffect, useRef, useMemo, useState } from 'react';
 import { marked, type TokenizerExtension, type RendererExtension } from 'marked';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
 import remend from 'remend';
 import DOMPurify from 'dompurify';
-import { apiFetch, type SessionAttachment } from '../api';
+import { apiFetch, fetchAttachmentBlobUrl, type SessionAttachment } from '../api';
+import { useTranslation } from '../i18n';
 
 // ─── KaTeX extension for marked ────────────────────────────────────────────
 
@@ -73,7 +74,17 @@ export type MessageAction = { type: string; [key: string]: unknown };
 
 export type ChatItem =
   | { type: 'user'; text: string; streaming: false; name?: string; attachments?: SessionAttachment[] }
-  | { type: 'assistant'; text: string; streaming: boolean; name?: string; actions?: MessageAction[]; actionsResolved?: boolean; actionsApproved?: boolean }
+  | { type: 'assistant'; text: string; streaming: boolean; name?: string; actions?: MessageAction[]; actionsResolved?: boolean; actionsApproved?: boolean; attachments?: SessionAttachment[] }
+  | {
+      type: 'attachment';
+      sessionId: string;
+      attachmentId: string;
+      mimeType: string;
+      kind: 'image' | 'audio' | 'video' | 'document';
+      name?: string;
+      size?: number;
+      caption?: string;
+    }
   | { type: 'event'; text: string; isError: boolean }
   | { type: 'tool'; tool: string; toolCallId?: string; args?: unknown; phase: 'running' | 'done'; isError?: boolean; result?: string }
   | { type: 'approval'; toolName: string; toolCallId: string; args?: unknown; resolved: boolean; approved?: boolean }
@@ -144,12 +155,13 @@ function FormatJson({ value, maxLen = 1200 }: { value: unknown; maxLen?: number 
 }
 
 function ToolCard({ item }: { item: Extract<ChatItem, { type: 'tool' }> }) {
+  const { t } = useTranslation();
   const icon = item.phase === 'done'
     ? (item.isError ? '✗' : '✓')
     : (item.phase === 'running' ? '●' : '○');
   const statusLabel = item.phase === 'done'
-    ? (item.isError ? 'error' : 'done')
-    : item.phase;
+    ? (item.isError ? t('chatMessages.toolStatusError') : t('chatMessages.toolStatusDone'))
+    : t('chatMessages.toolStatusRunning');
 
   const doneClass = item.phase === 'done' ? (item.isError ? 'tool-card--error' : 'tool-card--done') : '';
   const hasBody = item.args != null || item.result;
@@ -157,7 +169,7 @@ function ToolCard({ item }: { item: Extract<ChatItem, { type: 'tool' }> }) {
   return (
     <details className={`tool-card ${doneClass}`} open={item.phase !== 'done'}>
       <summary className="tool-card__header">
-        <span className="tool-card__label">Tool:</span>
+        <span className="tool-card__label">{t('chatMessages.toolLabel')}</span>
         <span className="tool-card__name">{item.tool}</span>
         <span
           className={`tool-card__icon${item.phase === 'done' ? (item.isError ? ' tool-card__icon--error' : ' tool-card__icon--done') : ''}`}
@@ -193,7 +205,8 @@ function formatChipSize(n?: number): string {
 }
 
 function AttachmentChip({ attachment }: { attachment: SessionAttachment }) {
-  const name = attachment.name || attachment.id || 'attachment';
+  const { t } = useTranslation();
+  const name = attachment.name || attachment.id || t('chatMessages.attachmentAlt');
   const size = formatChipSize(attachment.size);
   return (
     <div className="attachment-chip" title={attachment.mimeType || undefined}>
@@ -208,24 +221,119 @@ function AttachmentChip({ attachment }: { attachment: SessionAttachment }) {
   );
 }
 
+function AttachmentMedia({ item }: { item: Extract<ChatItem, { type: 'attachment' }> }) {
+  const { t } = useTranslation();
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setBlobUrl(null);
+    setError(null);
+    let cancelled = false;
+    let url: string | null = null;
+    fetchAttachmentBlobUrl(item.sessionId, item.attachmentId)
+      .then((res) => {
+        if (cancelled) {
+          URL.revokeObjectURL(res.url);
+          return;
+        }
+        url = res.url;
+        setBlobUrl(res.url);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      });
+    return () => {
+      cancelled = true;
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [item.sessionId, item.attachmentId]);
+
+  if (error) {
+    return (
+      <div className="event event--error">
+        {t('chatMessages.attachmentFailed', { name: item.name || item.attachmentId, error })}
+      </div>
+    );
+  }
+
+  if (!blobUrl) {
+    return (
+      <div className="message__body">
+        {t('chatMessages.loadingAttachment', { name: item.name || item.attachmentId })}<span className="thinking-dots" />
+      </div>
+    );
+  }
+
+  const downloadName = item.name || item.attachmentId;
+
+  return (
+    <div className="message__attachment">
+      {item.kind === 'image' && (
+        <a href={blobUrl} target="_blank" rel="noreferrer" download={downloadName}>
+          <img
+            src={blobUrl}
+            alt={item.name || t('chatMessages.attachmentAlt')}
+            style={{ maxWidth: '100%', maxHeight: 480, borderRadius: 8 }}
+          />
+        </a>
+      )}
+      {item.kind === 'audio' && (
+        <audio controls src={blobUrl} style={{ width: '100%' }} />
+      )}
+      {item.kind === 'video' && (
+        <video
+          controls
+          src={blobUrl}
+          style={{ maxWidth: '100%', maxHeight: 480, borderRadius: 8 }}
+        />
+      )}
+      {item.kind === 'document' && (
+        <a
+          className="attachment-chip"
+          href={blobUrl}
+          target="_blank"
+          rel="noreferrer"
+          download={downloadName}
+          title={item.mimeType}
+        >
+          <span className="attachment-chip__icon" aria-hidden="true">📎</span>
+          <span className="attachment-chip__name">{downloadName}</span>
+        </a>
+      )}
+      {item.caption && (
+        <div
+          className="message__body"
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(item.caption, false) }}
+        />
+      )}
+    </div>
+  );
+}
+
 function ApprovalCard({ item, onApproval }: { item: Extract<ChatItem, { type: 'approval' }>; onApproval: Props['onApproval'] }) {
+  const { t } = useTranslation();
   if (item.resolved) {
     return (
       <div className="event">
-        {item.approved ? `[approved] ${item.toolName}` : `[denied] ${item.toolName}`}
+        {item.approved
+          ? t('chatMessages.approvedEvent', { tool: item.toolName })
+          : t('chatMessages.deniedEvent', { tool: item.toolName })}
       </div>
     );
   }
 
   return (
     <div className="approval-card">
-      <div className="approval-card__title">Approval required · {item.toolName}</div>
+      <div className="approval-card__title">{t('chatMessages.approvalRequired', { tool: item.toolName })}</div>
       <div className="approval-card__body">
-        {item.args != null ? <FormatJson value={item.args} /> : 'No arguments'}
+        {item.args != null ? <FormatJson value={item.args} /> : t('chatMessages.noArguments')}
       </div>
       <div className="approval-card__actions">
-        <button className="btn btn--primary" onClick={() => void onApproval(item.toolCallId, true)}>Approve</button>
-        <button className="btn btn--ghost" onClick={() => void onApproval(item.toolCallId, false)}>Deny</button>
+        <button className="btn btn--primary" onClick={() => void onApproval(item.toolCallId, true)}>{t('chatMessages.approve')}</button>
+        <button className="btn btn--ghost" onClick={() => void onApproval(item.toolCallId, false)}>{t('chatMessages.deny')}</button>
       </div>
     </div>
   );
@@ -240,7 +348,11 @@ type Turn =
   | { kind: 'introspection'; item: Extract<ChatItem, { type: 'introspection' }> };
 
 const isAssistantItem = (item: ChatItem) =>
-  item.type === 'assistant' || item.type === 'tool' || item.type === 'approval' || item.type === 'thinking';
+  item.type === 'assistant' ||
+  item.type === 'tool' ||
+  item.type === 'approval' ||
+  item.type === 'thinking' ||
+  item.type === 'attachment';
 
 function groupIntoTurns(items: ChatItem[]): Turn[] {
   const turns: Turn[] = [];
@@ -266,8 +378,9 @@ function groupIntoTurns(items: ChatItem[]): Turn[] {
 // ─── Main ──────────────────────────────────────────────────────────────────
 
 export function ChatMessages({ items, agentName, loading, emptyMessage, onApproval, onMessageAction }: Props) {
+  const { t } = useTranslation();
   const containerRef = useRef<HTMLElement>(null);
-  const displayAgentName = agentName || 'Assistant';
+  const displayAgentName = agentName || t('chatMessages.assistant');
 
   useEffect(() => {
     if (containerRef.current) {
@@ -278,7 +391,7 @@ export function ChatMessages({ items, agentName, loading, emptyMessage, onApprov
   if (loading) {
     return (
       <section className="chat__messages" ref={containerRef}>
-        <div className="empty-state">Loading session history<span className="thinking-dots" /></div>
+        <div className="empty-state">{t('chatMessages.loadingHistory')}<span className="thinking-dots" /></div>
       </section>
     );
   }
@@ -286,7 +399,7 @@ export function ChatMessages({ items, agentName, loading, emptyMessage, onApprov
   if (items.length === 0) {
     return (
       <section className="chat__messages" ref={containerRef}>
-        <div className="empty-state">{emptyMessage ?? 'Start a conversation or select a session from the sidebar.'}</div>
+        <div className="empty-state">{emptyMessage ?? t('chatMessages.empty')}</div>
       </section>
     );
   }
@@ -300,7 +413,7 @@ export function ChatMessages({ items, agentName, loading, emptyMessage, onApprov
           const item = turn.items[0];
           return (
             <article key={ti} className="message message--user">
-              <div className="message__title">{item.name || 'You'}</div>
+              <div className="message__title">{item.name || t('chatMessages.you')}</div>
               {item.text && <div className="message__body">{item.text}</div>}
               {item.attachments && item.attachments.length > 0 && (
                 <div className="message__attachments">
@@ -316,7 +429,7 @@ export function ChatMessages({ items, agentName, loading, emptyMessage, onApprov
         if (turn.kind === 'event') {
           return (
             <div key={ti} className={`event${turn.item.isError ? ' event--error' : ''}`}>
-              {turn.item.isError ? `[error] ${turn.item.text}` : turn.item.text}
+              {turn.item.isError ? t('chatMessages.errorPrefix', { text: turn.item.text }) : turn.item.text}
             </div>
           );
         }
@@ -326,7 +439,9 @@ export function ChatMessages({ items, agentName, loading, emptyMessage, onApprov
           return (
             <details key={ti} className="introspection-block">
               <summary className="introspection-block__header">
-                Introspection{summary ? ` — ${summary}` : ''}
+                {summary
+                  ? t('chatMessages.introspectionWithSummary', { summary })
+                  : t('chatMessages.introspection')}
               </summary>
               <div className="introspection-block__body">
                 {tools.map((tool, ii) => <ToolCard key={ii} item={tool} />)}
@@ -351,7 +466,7 @@ export function ChatMessages({ items, agentName, loading, emptyMessage, onApprov
                         <div className="message__actions">
                           {item.actionsResolved ? (
                             <div className="message__actions-status">
-                              {item.actionsApproved ? '✅ Approved' : '✗ Rejected'}
+                              {item.actionsApproved ? t('chatMessages.approvedStatus') : t('chatMessages.rejectedStatus')}
                             </div>
                           ) : (
                             item.actions.map((action, ai) => (
@@ -360,12 +475,12 @@ export function ChatMessages({ items, agentName, loading, emptyMessage, onApprov
                                   className="btn btn--primary"
                                   onClick={() => onMessageAction && void onMessageAction(action, true)}
                                   disabled={!onMessageAction}
-                                >Approve</button>
+                                >{t('chatMessages.approve')}</button>
                                 <button
                                   className="btn btn--ghost"
                                   onClick={() => onMessageAction && void onMessageAction(action, false)}
                                   disabled={!onMessageAction}
-                                >Reject</button>
+                                >{t('chatMessages.reject')}</button>
                               </div>
                             ))
                           )}
@@ -377,16 +492,20 @@ export function ChatMessages({ items, agentName, loading, emptyMessage, onApprov
                   return <ToolCard key={ii} item={item} />;
                 case 'approval':
                   return <ApprovalCard key={ii} item={item} onApproval={onApproval} />;
+                case 'attachment':
+                  return <AttachmentMedia key={ii} item={item} />;
                 case 'thinking':
                   return item.text ? (
                     <details key={ii} className="thinking-block" open={item.streaming}>
                       <summary className="thinking-block__header">
-                        {item.streaming ? <>Thinking<span className="thinking-dots" /></> : 'Thinking'}
+                        {item.streaming
+                          ? <>{t('chatMessages.thinking')}<span className="thinking-dots" /></>
+                          : t('chatMessages.thinking')}
                       </summary>
                       <div className="thinking-block__body" dangerouslySetInnerHTML={{ __html: renderMarkdown(item.text, item.streaming) }} />
                     </details>
                   ) : (
-                    <div key={ii} className="message__body thinking-indicator">Thinking<span className="thinking-dots" /></div>
+                    <div key={ii} className="message__body thinking-indicator">{t('chatMessages.thinking')}<span className="thinking-dots" /></div>
                   );
               }
             })}
