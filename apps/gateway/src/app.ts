@@ -1690,6 +1690,51 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     return c.json(identities);
   });
 
+  /**
+   * Attach a `(channel, channelUserId)` identity to an existing user.
+   *
+   * Mirrors the implicit linkIdentity that happens during device-key /
+   * admin-issued token exchange, but lets a back-office caller stitch
+   * identities together explicitly — e.g. when the same human has two
+   * channel logins (Telegram + the web SPA) and you want both pointing
+   * at one canonical user.
+   *
+   * Note: if the `(channel, channelUserId)` pair is already linked to a
+   * different user, `linkIdentity` reassigns it (and prunes the now-orphan
+   * source user). That's the desired merge behavior, but it IS destructive
+   * — only call this from a trusted back-office context.
+   */
+  app.post('/api/admin/users/:userId/identities', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!userStore) {
+      throw new OpenHermitError('User store is not configured.', 'not_configured', 500);
+    }
+    const userId = c.req.param('userId');
+    const body = await c.req.json().catch(() => ({})) as {
+      channel?: unknown;
+      channelUserId?: unknown;
+    };
+    if (typeof body.channel !== 'string' || body.channel.length === 0) {
+      throw new ValidationError('channel is required.');
+    }
+    if (body.channel === 'admin') {
+      throw new ValidationError('channel "admin" is reserved.');
+    }
+    if (typeof body.channelUserId !== 'string' || body.channelUserId.length === 0) {
+      throw new ValidationError('channelUserId is required.');
+    }
+    if (!(await userStore.get(userId))) {
+      throw new NotFoundError(`User ${userId} not found.`);
+    }
+    await userStore.linkIdentity({
+      userId,
+      channel: body.channel,
+      channelUserId: body.channelUserId,
+      createdAt: new Date().toISOString(),
+    });
+    return c.json({ ok: true });
+  });
+
   app.get('/api/admin/users/:userId/agents', async (c) => {
     requireAdmin(c.req.header('authorization'));
     if (!userStore) return c.json([]);
@@ -2291,6 +2336,110 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     await store.enable(agentId, c.req.param('id'));
     await syncAffectedAgentSkillMounts(agentId, store);
     return c.json({ ok: true });
+  });
+
+  // Re-read SKILL.md frontmatter from `registry/skills/<id>/`, upsert name /
+  // description / path back into the `skills` row, and refresh sandbox file
+  // contents for every running agent that has the skill enabled. Body
+  // shape: `{ id?: string }` — pass an id to sync one skill, omit (or pass
+  // '*') to sync every registered system skill.
+  //
+  // Bridges the gap between "operator edits SKILL.md on disk" and "agents
+  // see the new content + DB description". Only touches `source === 'system'`
+  // rows; user-installed skills are owned by their installers and managed
+  // through the skill-install tool, not by this endpoint.
+  app.post('/api/admin/skills/sync', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    const store = requireSkillStore();
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    const requestedId =
+      typeof body.id === 'string' && body.id !== '' && body.id !== '*'
+        ? body.id
+        : undefined;
+
+    const { parseFrontmatter } = await import('@openhermit/agent/skills');
+    const { readFile } = await import('node:fs/promises');
+
+    const all = await store.list();
+    const systemSkills = all.filter((s) => s.source === 'system');
+
+    let targets;
+    if (requestedId) {
+      const match = all.find((s) => s.id === requestedId);
+      if (!match) {
+        return c.json({
+          results: [{ id: requestedId, action: 'not_registered' }],
+          agentsRefreshed: 0,
+        });
+      }
+      if (match.source !== 'system') {
+        throw new ValidationError(
+          `Skill ${requestedId} is a user skill — sync only applies to system skills.`,
+        );
+      }
+      targets = [match];
+    } else {
+      targets = systemSkills;
+    }
+
+    interface SyncResultEntry {
+      id: string;
+      action: 'updated' | 'unchanged' | 'missing_on_disk' | 'not_registered';
+      changes?: Record<string, { from: string; to: string }>;
+    }
+    const results: SyncResultEntry[] = [];
+
+    for (const existing of targets) {
+      // Read from the path recorded on the row — that's where the skill
+      // actually lives. Built-in skills point at a bundled location (e.g.
+      // inside @openhermit/agent); operator-registered system skills
+      // point at `<gatewayDir>/registry/skills/<id>/` (or wherever
+      // `register --path` was given). Either way, frontmatter that's
+      // visible to the runner is the frontmatter at this path.
+      const skillMdPath = path.join(existing.path, 'SKILL.md');
+      let content: string;
+      try {
+        content = await readFile(skillMdPath, 'utf8');
+      } catch {
+        results.push({ id: existing.id, action: 'missing_on_disk' });
+        continue;
+      }
+      const fm = parseFrontmatter(content);
+      const newName = fm.name || existing.name;
+      const newDescription = fm.description || existing.description;
+
+      const changes: Record<string, { from: string; to: string }> = {};
+      if (newName !== existing.name) {
+        changes.name = { from: existing.name, to: newName };
+      }
+      if (newDescription !== existing.description) {
+        changes.description = { from: existing.description, to: newDescription };
+      }
+
+      if (Object.keys(changes).length === 0) {
+        results.push({ id: existing.id, action: 'unchanged' });
+        continue;
+      }
+
+      const now = new Date().toISOString();
+      await store.upsert({
+        ...existing,
+        name: newName,
+        description: newDescription,
+        updatedAt: now,
+      });
+      results.push({ id: existing.id, action: 'updated', changes });
+    }
+
+    // Always re-copy sandbox skill dirs: SKILL.md body and helper scripts
+    // can change without any frontmatter diff, so DB "unchanged" does not
+    // imply "agents already see the latest bytes".
+    await syncAffectedAgentSkillMounts('*', store);
+
+    return c.json({
+      results,
+      agentsRefreshed: instances.getRunningAgentIds().length,
+    });
   });
 
   app.post('/api/admin/skills/:id/disable', async (c) => {
