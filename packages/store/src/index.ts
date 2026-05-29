@@ -35,7 +35,6 @@ export type {
   ScheduleUpdateInput,
   ScheduleType,
   ScheduleStatus,
-  ScheduleSessionMode,
   ScheduleDelivery,
   SchedulePolicy,
   ScheduleRunRecord,
@@ -68,7 +67,7 @@ export type {
   ModelProviderRecord,
 } from './types.js';
 
-export { STANDALONE_AGENT_ID, standaloneScope, skillStorageId } from './types.js';
+export { STANDALONE_AGENT_ID, standaloneScope } from './types.js';
 
 /**
  * Reserved session id for the per-agent owner inbox feed (read-only).
@@ -117,7 +116,6 @@ export {
   SupabaseAttachmentStorage,
   type SupabaseAttachmentStorageOptions,
   DbMetaStore,
-  DbConsumedJtiStore,
   generateSecretsKey,
   runMigrations,
   DbGatewaySecretStore,

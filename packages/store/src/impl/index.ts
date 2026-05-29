@@ -92,4 +92,3 @@ export {
 } from './db-agent-channel-store.js';
 export { runMigrations } from './migrator.js';
 export { DbMetaStore } from './meta-store.js';
-export { DbConsumedJtiStore } from './consumed-jti-store.js';

@@ -33,6 +33,8 @@ import type {
   DbSkillStore,
   DbUserStore,
   DbAgentChannelStore,
+  DbModelProviderStore,
+  DbGatewaySecretStore,
   SandboxStore,
   AttachmentStorage,
 } from '@openhermit/store';
@@ -63,7 +65,7 @@ import {
   registerAttachmentRoutes,
   DEFAULT_ATTACHMENT_MAX_BYTES,
 } from './attachment-routes.js';
-import { resolveInboundAttachments } from '@openhermit/agent/attachments';
+import { resolveInboundAttachments } from './attachment-url-passthrough.js';
 import type { LogBuffer } from './log-buffer.js';
 import {
   type AuthContext,
@@ -74,7 +76,6 @@ import {
   signJwt,
   tokensMatch,
   verifyAdminToken,
-  verifyJwt,
 } from './auth.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -239,7 +240,6 @@ export interface GatewayAppOptions {
   attachmentMaxBytes?: number | undefined;
   metaStore?: import('@openhermit/store').DbMetaStore | undefined;
   sessionStore?: import('@openhermit/store').DbSessionStore | undefined;
-  consumedJtiStore?: import('@openhermit/store').DbConsumedJtiStore | undefined;
   /** Named sandbox presets, keyed by preset name. */
   sandboxPresets?: Record<string, SandboxPreset> | undefined;
   /** Default preset to use when an agent is created without an explicit `sandbox` field. Null disables auto-provisioning. */
@@ -256,6 +256,10 @@ export interface GatewayAppOptions {
   publicDir?: string | undefined;
   /** CORS allowed origin (default: '*'). */
   corsOrigin?: string | undefined;
+  /** Global model provider registry. Admin-managed; agents select from enabled entries. */
+  modelProviderStore?: DbModelProviderStore | undefined;
+  /** Gateway-level secret store for shared API keys. */
+  gatewaySecretStore?: DbGatewaySecretStore | undefined;
 }
 
 // ─── Resolve runner helper ────────────────────────────────────────────────────
@@ -280,7 +284,8 @@ const resolveRunner = async (
 // ─── App factory ──────────────────────────────────────────────────────────────
 
 export const createGatewayApp = (options: GatewayAppOptions): Hono => {
-  const { instances, agentStore, adminToken, userStore, configStore, consumedJtiStore } = options;
+  const { instances, agentStore, adminToken, userStore, configStore } = options;
+  const { modelProviderStore, gatewaySecretStore } = options;
   const log = options.logger ?? ((msg: string) => console.log(msg));
   const app = new Hono();
 
@@ -413,7 +418,6 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
       const { token, expiresAt } = await signJwt(authOptions.jwt, {
         channel: authResult.channel,
         channelUserId: authResult.channelUserId,
-        issuer: 'device-key',
       });
 
       return c.json({
@@ -492,8 +496,6 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
         channel?: string;
         channelUserId?: string;
         displayName?: string;
-        purpose?: string;
-        ttlSeconds?: number;
       };
       if (!body.channel || typeof body.channel !== 'string') {
         throw new ValidationError('channel is required.');
@@ -508,28 +510,6 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
       }
       if (body.displayName !== undefined && typeof body.displayName !== 'string') {
         throw new ValidationError('displayName must be a string if provided.');
-      }
-      const purpose: 'session' | 'exchange' =
-        body.purpose === 'exchange' ? 'exchange' : 'session';
-      // `exchange` tokens are designed to be carried in URL fragments and
-      // immediately swapped via /api/auth/exchange. They must be short-lived
-      // so a leaked URL is only briefly dangerous; an hour-long exchange
-      // token would defeat the point. A `session` mint keeps the historical
-      // 24h default.
-      const maxTtl = purpose === 'exchange' ? 600 : 86400;
-      let ttlSeconds: number | undefined;
-      if (body.ttlSeconds !== undefined) {
-        if (
-          typeof body.ttlSeconds !== 'number'
-          || !Number.isInteger(body.ttlSeconds)
-          || body.ttlSeconds < 1
-          || body.ttlSeconds > maxTtl
-        ) {
-          throw new ValidationError(`ttlSeconds must be an integer between 1 and ${maxTtl}.`);
-        }
-        ttlSeconds = body.ttlSeconds;
-      } else if (purpose === 'exchange') {
-        ttlSeconds = 120;
       }
 
       let userId = await userStore.resolve(body.channel, body.channelUserId);
@@ -561,9 +541,6 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
       const { token, expiresAt } = await signJwt(authOptions.jwt, {
         channel: body.channel,
         channelUserId: body.channelUserId,
-        issuer: 'admin-issued',
-        purpose,
-        ...(ttlSeconds ? { expiry: `${ttlSeconds}s` } : {}),
       });
 
       return c.json({
@@ -572,64 +549,6 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
         userId,
         isNewDevice: created,
         ...(body.displayName ? { displayName: body.displayName } : {}),
-        purpose,
-      });
-    });
-
-    /**
-     * Swap a single-use `purpose: 'exchange'` token for a normal session JWT.
-     *
-     * Designed for the web `/connect#token=…` deep-link flow: an external
-     * platform mints a short-lived exchange token via the admin-issued path,
-     * embeds it in the URL fragment, and the web app calls this endpoint
-     * (anonymous — the exchange token IS the credential) to swap it for a
-     * regular 24h session JWT. The exchange token's `jti` is recorded on
-     * success so a second attempt to redeem it is rejected (single-use).
-     *
-     * Body: { token: <exchange-jwt> }
-     * Returns: same shape as /api/admin/auth/issue-token's session response.
-     */
-    app.post('/api/auth/exchange', async (c) => {
-      if (!userStore) {
-        throw new OpenHermitError('User store is not configured.', 'not_configured', 500);
-      }
-      if (!consumedJtiStore) {
-        throw new OpenHermitError('Token exchange is not configured.', 'not_configured', 500);
-      }
-      const body = await c.req.json().catch(() => ({})) as { token?: string };
-      if (!body.token || typeof body.token !== 'string') {
-        throw new ValidationError('token is required.');
-      }
-      const payload = await verifyJwt(authOptions.jwt, body.token, {
-        allowPurpose: 'exchange',
-      });
-      if (!payload || !payload.jti || typeof payload.exp !== 'number') {
-        throw new UnauthorizedError('Exchange token is invalid or expired.');
-      }
-      const consumed = await consumedJtiStore.tryConsume(
-        payload.jti,
-        payload.exp,
-        new Date().toISOString(),
-      );
-      if (!consumed) {
-        throw new UnauthorizedError('Exchange token has already been used.');
-      }
-
-      const userId = await userStore.resolve(payload.channel, payload.channelUserId);
-      const user = userId ? await userStore.get(userId) : undefined;
-
-      const { token: sessionToken, expiresAt } = await signJwt(authOptions.jwt, {
-        channel: payload.channel,
-        channelUserId: payload.channelUserId,
-        issuer: 'admin-issued',
-        purpose: 'session',
-      });
-
-      return c.json({
-        token: sessionToken,
-        expiresAt,
-        userId,
-        ...(user?.name ? { displayName: user.name } : {}),
       });
     });
 
@@ -952,7 +871,32 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
         500,
       );
     }
-    const templateConfig = buildDefaultAgentConfig(record.workspaceDir);
+    let templateConfig = buildDefaultAgentConfig(record.workspaceDir);
+
+    // If a global model registry is configured, use the first enabled
+    // model as the default instead of the hardcoded fallback.
+    if (modelProviderStore) {
+      try {
+        const enabledModels = await modelProviderStore.list(true);
+        const defaultModel = enabledModels[0];
+        if (defaultModel) {
+          templateConfig = {
+            ...templateConfig,
+            model: {
+              provider: defaultModel.provider,
+              model: defaultModel.model,
+              max_tokens: defaultModel.maxTokens,
+              ...(defaultModel.baseUrl ? { base_url: defaultModel.baseUrl } : {}),
+              ...(defaultModel.api ? { api: defaultModel.api } : {}),
+              ...(defaultModel.thinking ? { thinking: defaultModel.thinking as any } : {}),
+            },
+          };
+        }
+      } catch {
+        // Ignore — fallback to the built-in default.
+      }
+    }
+
     if (
       body.access !== undefined &&
       body.access !== 'public' &&
@@ -1025,15 +969,10 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     // built-in token-based ones).
     if (options.agentChannelStore) {
       for (const key of options.manifestRegistry.keys()) {
-        // Seed config from the manifest so secret placeholders
-        // (`${{TOKEN}}`) are already in place when the owner first enables
-        // the channel — no need to know the field names by heart.
-        const defaults = options.manifestRegistry.get(key)?.defaultConfig;
         await options.agentChannelStore.createBuiltin({
           agentId: record.agentId,
           channelType: key,
           enabled: false,
-          ...(defaults ? { config: { ...defaults } } : {}),
         });
       }
     }
@@ -1199,7 +1138,7 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     // Pass caller identity directly to the runtime instead of injecting
     // it into session metadata — keeps "who's calling now" cleanly
     // separated from the session's persisted attributes.
-    const caller = (auth.mode === 'user' || auth.mode === 'channel') && auth.channelUserId
+    const caller = auth.mode === 'user' && auth.channelUserId
       ? { channel: auth.channel, channelUserId: auth.channelUserId }
       : undefined;
     const session = await runtime.openSession(payload, caller);
@@ -1751,51 +1690,6 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     return c.json(identities);
   });
 
-  /**
-   * Attach a `(channel, channelUserId)` identity to an existing user.
-   *
-   * Mirrors the implicit linkIdentity that happens during device-key /
-   * admin-issued token exchange, but lets a back-office caller stitch
-   * identities together explicitly — e.g. when the same human has two
-   * channel logins (Telegram + the web SPA) and you want both pointing
-   * at one canonical user.
-   *
-   * Note: if the `(channel, channelUserId)` pair is already linked to a
-   * different user, `linkIdentity` reassigns it (and prunes the now-orphan
-   * source user). That's the desired merge behavior, but it IS destructive
-   * — only call this from a trusted back-office context.
-   */
-  app.post('/api/admin/users/:userId/identities', async (c) => {
-    requireAdmin(c.req.header('authorization'));
-    if (!userStore) {
-      throw new OpenHermitError('User store is not configured.', 'not_configured', 500);
-    }
-    const userId = c.req.param('userId');
-    const body = await c.req.json().catch(() => ({})) as {
-      channel?: unknown;
-      channelUserId?: unknown;
-    };
-    if (typeof body.channel !== 'string' || body.channel.length === 0) {
-      throw new ValidationError('channel is required.');
-    }
-    if (body.channel === 'admin') {
-      throw new ValidationError('channel "admin" is reserved.');
-    }
-    if (typeof body.channelUserId !== 'string' || body.channelUserId.length === 0) {
-      throw new ValidationError('channelUserId is required.');
-    }
-    if (!(await userStore.get(userId))) {
-      throw new NotFoundError(`User ${userId} not found.`);
-    }
-    await userStore.linkIdentity({
-      userId,
-      channel: body.channel,
-      channelUserId: body.channelUserId,
-      createdAt: new Date().toISOString(),
-    });
-    return c.json({ ok: true });
-  });
-
   app.get('/api/admin/users/:userId/agents', async (c) => {
     requireAdmin(c.req.header('authorization'));
     if (!userStore) return c.json([]);
@@ -1892,6 +1786,176 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     } catch (err) {
       throw new ValidationError(err instanceof Error ? err.message : String(err));
     }
+  });
+
+  // ── Model providers (admin-only) ───────────────────────────────────
+  // Global model registry: admins register models, agents pick from
+  // the enabled set.
+
+  app.get('/api/admin/models', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!modelProviderStore) {
+      throw new OpenHermitError('Model provider store is not configured.', 'not_configured', 500);
+    }
+    const models = await modelProviderStore.list(false);
+
+    // Enrich each model with whether its associated gateway secret is set.
+    const enriched = await Promise.all(models.map(async (m) => {
+      let secretSet = false;
+      if (gatewaySecretStore) {
+        const val = await gatewaySecretStore.get(m.secretName);
+        secretSet = val != null && val.length > 0;
+      }
+      return { ...m, secretSet };
+    }));
+    return c.json(enriched);
+  });
+
+  app.post('/api/admin/models', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!modelProviderStore) {
+      throw new OpenHermitError('Model provider store is not configured.', 'not_configured', 500);
+    }
+    const body = await c.req.json().catch(() => undefined) as Record<string, unknown> | undefined;
+    if (!body || typeof body !== 'object') {
+      throw new ValidationError('Body must be a JSON object.');
+    }
+    if (!body.id || typeof body.id !== 'string') throw new ValidationError('id is required.');
+    if (!body.provider || typeof body.provider !== 'string') throw new ValidationError('provider is required.');
+    if (!body.model || typeof body.model !== 'string') throw new ValidationError('model is required.');
+    if (!body.secretName || typeof body.secretName !== 'string') throw new ValidationError('secretName is required.');
+
+    const existing = await modelProviderStore.get(body.id as string);
+    if (existing) {
+      return c.json({ error: { code: 'conflict', message: `Model already exists: ${body.id}` } }, 409);
+    }
+
+    const record = await modelProviderStore.create({
+      id: body.id as string,
+      name: (body.name as string) ?? (body.model as string),
+      provider: body.provider as string,
+      model: body.model as string,
+      maxTokens: typeof body.maxTokens === 'number' ? body.maxTokens : 8192,
+      baseUrl: typeof body.baseUrl === 'string' ? body.baseUrl : null,
+      api: typeof body.api === 'string' ? body.api : null,
+      thinking: typeof body.thinking === 'string' ? body.thinking : null,
+      secretName: body.secretName as string,
+      enabled: typeof body.enabled === 'boolean' ? body.enabled : true,
+    });
+    return c.json(record, 201);
+  });
+
+  app.put('/api/admin/models/:id', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!modelProviderStore) {
+      throw new OpenHermitError('Model provider store is not configured.', 'not_configured', 500);
+    }
+    const id = c.req.param('id') ?? '';
+    const body = await c.req.json().catch(() => undefined) as Record<string, unknown> | undefined;
+    if (!body || typeof body !== 'object') {
+      throw new ValidationError('Body must be a JSON object.');
+    }
+    const patch: Record<string, unknown> = {};
+    if (body.name !== undefined) patch.name = body.name;
+    if (body.provider !== undefined) patch.provider = body.provider;
+    if (body.model !== undefined) patch.model = body.model;
+    if (body.maxTokens !== undefined) patch.maxTokens = body.maxTokens;
+    if (body.baseUrl !== undefined) patch.baseUrl = body.baseUrl;
+    if (body.api !== undefined) patch.api = body.api;
+    if (body.thinking !== undefined) patch.thinking = body.thinking;
+    if (body.secretName !== undefined) patch.secretName = body.secretName;
+    if (body.enabled !== undefined) patch.enabled = body.enabled;
+
+    const updated = await modelProviderStore.update(id, patch as any);
+    if (!updated) {
+      return c.json({ error: { code: 'not_found', message: `Model not found: ${id}` } }, 404);
+    }
+    return c.json(updated);
+  });
+
+  app.delete('/api/admin/models/:id', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!modelProviderStore) {
+      throw new OpenHermitError('Model provider store is not configured.', 'not_configured', 500);
+    }
+    const id = c.req.param('id') ?? '';
+    await modelProviderStore.delete(id);
+    return c.json({ ok: true });
+  });
+
+  // ── Gateway secrets (admin-only) ───────────────────────────────────
+  // Global API key storage shared across agents.
+
+  app.get('/api/admin/gateway/secrets', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!gatewaySecretStore) {
+      throw new OpenHermitError('Gateway secret store is not configured.', 'not_configured', 500);
+    }
+    const all = await gatewaySecretStore.listEntries();
+    const out: Record<string, { masked: string }> = {};
+    for (const [k, entry] of Object.entries(all)) {
+      out[k] = { masked: maskSecret(entry.value) };
+    }
+    return c.json(out);
+  });
+
+  app.put('/api/admin/gateway/secrets/:name', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!gatewaySecretStore) {
+      throw new OpenHermitError('Gateway secret store is not configured.', 'not_configured', 500);
+    }
+    const name = c.req.param('name') ?? '';
+    if (!name) throw new ValidationError('Secret name required.');
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new ValidationError(
+        'Secret name must be a valid POSIX env-var identifier (letters, digits, underscore; not starting with a digit).',
+      );
+    }
+    const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new ValidationError('Body must be a JSON object.');
+    }
+    const value = body.value;
+    if (typeof value !== 'string') {
+      throw new ValidationError('value (string) is required.');
+    }
+    await gatewaySecretStore.set(name, value);
+    return c.json({ ok: true });
+  });
+
+  app.delete('/api/admin/gateway/secrets/:name', async (c) => {
+    requireAdmin(c.req.header('authorization'));
+    if (!gatewaySecretStore) {
+      throw new OpenHermitError('Gateway secret store is not configured.', 'not_configured', 500);
+    }
+    const name = c.req.param('name') ?? '';
+    if (!name) throw new ValidationError('Secret name required.');
+    await gatewaySecretStore.delete(name);
+    return c.json({ ok: true });
+  });
+
+  // ── Agent available models (owner/admin) ───────────────────────────
+  // Returns enabled models from the global registry that the agent can
+  // switch to. Includes whether the associated API key is configured.
+
+  app.get('/api/agents/:agentId/available-models', async (c) => {
+    const agentId = c.req.param('agentId') ?? '';
+    await requireOwnerOrAdmin(c, agentId);
+    if (!modelProviderStore) {
+      // No model provider store configured — return empty list so the UI
+      // falls back to the pi-ai catalog (backward compatible).
+      return c.json([]);
+    }
+    const models = await modelProviderStore.list(true);
+    const enriched = await Promise.all(models.map(async (m) => {
+      let secretSet = false;
+      if (gatewaySecretStore) {
+        const val = await gatewaySecretStore.get(m.secretName);
+        secretSet = val != null && val.length > 0;
+      }
+      return { ...m, secretSet };
+    }));
+    return c.json(enriched);
   });
 
   app.get('/api/agents/:agentId/info', async (c) => {
@@ -2191,8 +2255,6 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     const now = new Date().toISOString();
     await store.upsert({
       id: body.id,
-      // System skills: slug equals id (storage id == user-visible id).
-      slug: body.id,
       name: body.name,
       description: body.description,
       path: body.path,
@@ -2229,110 +2291,6 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     await store.enable(agentId, c.req.param('id'));
     await syncAffectedAgentSkillMounts(agentId, store);
     return c.json({ ok: true });
-  });
-
-  // Re-read SKILL.md frontmatter from `registry/skills/<id>/`, upsert name /
-  // description / path back into the `skills` row, and refresh sandbox file
-  // contents for every running agent that has the skill enabled. Body
-  // shape: `{ id?: string }` — pass an id to sync one skill, omit (or pass
-  // '*') to sync every registered system skill.
-  //
-  // Bridges the gap between "operator edits SKILL.md on disk" and "agents
-  // see the new content + DB description". Only touches `source === 'system'`
-  // rows; user-installed skills are owned by their installers and managed
-  // through the skill-install tool, not by this endpoint.
-  app.post('/api/admin/skills/sync', async (c) => {
-    requireAdmin(c.req.header('authorization'));
-    const store = requireSkillStore();
-    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
-    const requestedId =
-      typeof body.id === 'string' && body.id !== '' && body.id !== '*'
-        ? body.id
-        : undefined;
-
-    const { parseFrontmatter } = await import('@openhermit/agent/skills');
-    const { readFile } = await import('node:fs/promises');
-
-    const all = await store.list();
-    const systemSkills = all.filter((s) => s.source === 'system');
-
-    let targets;
-    if (requestedId) {
-      const match = all.find((s) => s.id === requestedId);
-      if (!match) {
-        return c.json({
-          results: [{ id: requestedId, action: 'not_registered' }],
-          agentsRefreshed: 0,
-        });
-      }
-      if (match.source !== 'system') {
-        throw new ValidationError(
-          `Skill ${requestedId} is a user skill — sync only applies to system skills.`,
-        );
-      }
-      targets = [match];
-    } else {
-      targets = systemSkills;
-    }
-
-    interface SyncResultEntry {
-      id: string;
-      action: 'updated' | 'unchanged' | 'missing_on_disk' | 'not_registered';
-      changes?: Record<string, { from: string; to: string }>;
-    }
-    const results: SyncResultEntry[] = [];
-
-    for (const existing of targets) {
-      // Read from the path recorded on the row — that's where the skill
-      // actually lives. Built-in skills point at a bundled location (e.g.
-      // inside @openhermit/agent); operator-registered system skills
-      // point at `<gatewayDir>/registry/skills/<id>/` (or wherever
-      // `register --path` was given). Either way, frontmatter that's
-      // visible to the runner is the frontmatter at this path.
-      const skillMdPath = path.join(existing.path, 'SKILL.md');
-      let content: string;
-      try {
-        content = await readFile(skillMdPath, 'utf8');
-      } catch {
-        results.push({ id: existing.id, action: 'missing_on_disk' });
-        continue;
-      }
-      const fm = parseFrontmatter(content);
-      const newName = fm.name || existing.name;
-      const newDescription = fm.description || existing.description;
-
-      const changes: Record<string, { from: string; to: string }> = {};
-      if (newName !== existing.name) {
-        changes.name = { from: existing.name, to: newName };
-      }
-      if (newDescription !== existing.description) {
-        changes.description = { from: existing.description, to: newDescription };
-      }
-
-      if (Object.keys(changes).length === 0) {
-        results.push({ id: existing.id, action: 'unchanged' });
-        continue;
-      }
-
-      const now = new Date().toISOString();
-      await store.upsert({
-        ...existing,
-        name: newName,
-        description: newDescription,
-        updatedAt: now,
-      });
-      results.push({ id: existing.id, action: 'updated', changes });
-    }
-
-    // Always re-copy sandbox skill dirs: SKILL.md body and helper scripts
-    // can change without any frontmatter diff, so DB "unchanged" does not
-    // imply "agents already see the latest bytes".
-    await syncAffectedAgentSkillMounts('*', store);
-
-    return c.json({
-      results,
-      agentsRefreshed: instances.getRunningAgentIds().length,
-    });
   });
 
   app.post('/api/admin/skills/:id/disable', async (c) => {
@@ -2373,8 +2331,8 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     // No workspace info available — return DB-enabled skills only.
     const dbSkills = await store.listEnabled(agentId);
     return c.json(dbSkills.map((s) => ({
-      id: s.slug, name: s.name, description: s.description,
-      path: `/skills/${s.slug}`, source: 'system' as const,
+      id: s.id, name: s.name, description: s.description,
+      path: `/skills/${s.id}`, source: 'system' as const,
     })));
   });
 
@@ -2629,19 +2587,8 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
 
     const result = rows.map((row) => {
       const def = row.kind === 'builtin' ? BUILTIN_CHANNEL_DEFS[row.channelType] : undefined;
-      // Plugins declare their own form schema on the manifest; if the
-      // channel isn't a hardcoded gateway built-in, fall back to whatever
-      // the registered manifest exposes.
-      const manifest = !def ? options.manifestRegistry.get(row.channelType) : undefined;
-      const manifestSecretKeys = manifest?.secretKeys;
-      const manifestConfigFields = manifest?.configFields;
-      const manifestDefaultConfig = manifest?.defaultConfig;
-      const manifestLabel = manifest?.displayName;
-      const effectiveSecretKeys = def?.secretKeys ?? manifestSecretKeys;
-      const secretsSet = effectiveSecretKeys
-        ? effectiveSecretKeys
-            .filter((sk) => !('optional' in sk && sk.optional === true))
-            .every((sk) => secretNames.includes(sk.key))
+      const secretsSet = def
+        ? def.secretKeys.every((sk) => secretNames.includes(sk.key))
         : true;
       const runtime = runtimeStatuses.find((s) => s.name === row.channelType);
       // Prefer the live in-memory status (always current within this
@@ -2656,16 +2603,7 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
         : row.lastError ?? undefined;
       return {
         ...row,
-        ...(def
-          ? { label: row.label ?? def.label, secretKeys: def.secretKeys }
-          : manifest
-            ? {
-                label: row.label ?? manifestLabel ?? row.channelType,
-                ...(manifestSecretKeys ? { secretKeys: manifestSecretKeys } : {}),
-                ...(manifestConfigFields ? { configFields: manifestConfigFields } : {}),
-                ...(manifestDefaultConfig ? { defaultConfig: manifestDefaultConfig } : {}),
-              }
-            : {}),
+        ...(def ? { label: row.label ?? def.label, secretKeys: def.secretKeys } : {}),
         secretsSet,
         runtimeStatus: status,
         ...(error ? { error } : {}),
@@ -2701,17 +2639,13 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     const out = options.manifestRegistry.all().map((m) => {
       const origin = options.manifestRegistry.originOf(m.key) ?? 'external';
       const def = BUILTIN_CHANNEL_DEFS[m.key];
-      const secretKeys = def?.secretKeys ?? m.secretKeys;
-      const defaultConfig = def?.defaultConfig ?? m.defaultConfig;
       return {
         key: m.key,
         namespace: m.namespace,
         displayName: m.displayName,
         origin,
         supportsSetup: !!m.setup,
-        ...(secretKeys ? { secretKeys } : {}),
-        ...(m.configFields ? { configFields: m.configFields } : {}),
-        ...(defaultConfig ? { defaultConfig } : {}),
+        ...(def ? { secretKeys: def.secretKeys, defaultConfig: def.defaultConfig } : {}),
       };
     });
     return c.json(out);
@@ -2761,16 +2695,11 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
           `A channel of type "${channelType}" already exists on this agent.`,
         );
       }
-      const defaults = manifest.defaultConfig;
       const created = await store.createBuiltin({
         agentId,
         channelType,
         ...(body.label ? { label: body.label } : {}),
-        ...(body.config
-          ? { config: body.config }
-          : defaults
-            ? { config: { ...defaults } }
-            : {}),
+        ...(body.config ? { config: body.config } : {}),
         ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
       });
 
@@ -2843,10 +2772,6 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
 
     // For builtin channels, when first enabling we apply the default
     // config skeleton so the user doesn't have to know the field names.
-    // Prefer the hardcoded gateway table (telegram/discord/slack) for
-    // continuity, then fall back to the manifest — covers any channel
-    // plugin (debox, wechat, future externals) that declares its own
-    // `defaultConfig` with `${{SECRET}}` placeholders.
     let effectiveConfig: Record<string, unknown> | undefined = body.config;
     if (
       existing.kind === 'builtin'
@@ -2855,9 +2780,7 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
       && !body.config
     ) {
       const def = BUILTIN_CHANNEL_DEFS[existing.channelType];
-      const manifestDefaults = options.manifestRegistry.get(existing.channelType)?.defaultConfig;
-      const fallback = def?.defaultConfig ?? manifestDefaults;
-      if (fallback) effectiveConfig = { ...fallback };
+      if (def) effectiveConfig = { ...def.defaultConfig };
     }
 
     const updated = await store.update(channelId, {
@@ -3517,88 +3440,6 @@ export const createGatewayApp = (options: GatewayAppOptions): Hono => {
     if (!row) throw new NotFoundError(`Sandbox not found: ${alias}`);
     await store.delete(row.id);
     return c.json({ ok: true });
-  });
-
-  // --- voice: STT / TTS pass-through ---
-  //
-  // Channel adapters call these to transcribe inbound audio and
-  // synthesize outbound text. Auth is the same scope as session routes
-  // (channel token or user JWT), so a Telegram bridge can submit voice
-  // from a chat-scoped token without needing the agent's secrets.
-
-  app.post(gatewayRoutes.agentVoiceSttPattern, async (c) => {
-    const agentId = c.req.param('agentId') ?? '';
-    requireAuth(c, agentId);
-    const body = await c.req.json().catch(() => null) as
-      | { bytes?: string; mimeType?: string; languageHint?: string }
-      | null;
-    if (!body || typeof body.mimeType !== 'string') {
-      throw new ValidationError('Body must be { bytes: base64, mimeType, languageHint? }.');
-    }
-    if (typeof body.bytes !== 'string' || body.bytes.length === 0) {
-      throw new ValidationError('bytes (base64) is required.');
-    }
-
-    const runner = await resolveRunner(instances, agentId);
-    const { buildVoiceForAgent } = await import('@openhermit/agent/voice');
-    const voice = await buildVoiceForAgent(runner.security);
-    if (!voice.stt) {
-      throw new ValidationError('voice.stt is not configured for this agent.');
-    }
-
-    let bytes: Uint8Array;
-    try {
-      bytes = Uint8Array.from(Buffer.from(body.bytes, 'base64'));
-    } catch {
-      throw new ValidationError('bytes must be valid base64.');
-    }
-
-    const result = await voice.stt.transcribe({
-      bytes,
-      mimeType: body.mimeType,
-      ...(body.languageHint ? { languageHint: body.languageHint } : {}),
-    });
-    return c.json(result);
-  });
-
-  app.post(gatewayRoutes.agentVoiceTtsPattern, async (c) => {
-    const agentId = c.req.param('agentId') ?? '';
-    requireAuth(c, agentId);
-    const body = await c.req.json().catch(() => null) as
-      | {
-          text?: string;
-          outputMimeType?: string;
-          voiceId?: string;
-          modelId?: string;
-          speed?: number;
-        }
-      | null;
-    if (!body || typeof body.text !== 'string' || body.text.length === 0) {
-      throw new ValidationError('text is required.');
-    }
-    if (typeof body.outputMimeType !== 'string' || body.outputMimeType.length === 0) {
-      throw new ValidationError('outputMimeType is required.');
-    }
-
-    const runner = await resolveRunner(instances, agentId);
-    const { buildVoiceForAgent } = await import('@openhermit/agent/voice');
-    const voice = await buildVoiceForAgent(runner.security);
-    if (!voice.tts) {
-      throw new ValidationError('voice.tts is not configured for this agent.');
-    }
-
-    const result = await voice.tts.synthesize({
-      text: body.text,
-      outputMimeType: body.outputMimeType,
-      ...(body.voiceId ? { voiceId: body.voiceId } : {}),
-      ...(body.modelId ? { modelId: body.modelId } : {}),
-      ...(typeof body.speed === 'number' ? { speed: body.speed } : {}),
-    });
-    return c.json({
-      bytes: Buffer.from(result.bytes).toString('base64'),
-      mimeType: result.mimeType,
-      provider: result.provider,
-    });
   });
 
   // --- admin UI: static files ---
